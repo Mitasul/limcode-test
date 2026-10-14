@@ -430,7 +430,18 @@ function cancelThinkingTest(): void {
                   <span class="model-status" aria-hidden="true"></span>
                   <span class="model-info">
                     <span class="model-name-row">
-                      <span class="model-name">{{ model.name }}</span>
+                      <HoverTooltipPanel
+                        class="model-identity-tooltip"
+                        panel-title="模型信息"
+                        :rows="[{ label: '名称', value: model.name }, { label: 'ID', value: model.id }]"
+                        tabindex="0"
+                        :aria-label="`查看模型信息：${model.name}`"
+                      >
+                        <span class="model-identity-text">
+                          <span class="model-name">{{ model.name }}</span>
+                          <span class="model-id">ID: {{ model.id }}</span>
+                        </span>
+                      </HoverTooltipPanel>
                       <HoverTooltipPanel
                         v-if="isOpenAICompatibleChannel && thinkingProbeEvidenceFor(model.id)"
                         panel-title="思考参数测试结果"
@@ -448,7 +459,6 @@ function cancelThinkingTest(): void {
                         <span class="model-probe-tag is-failed" tabindex="0">测试失败</span>
                       </HoverTooltipPanel>
                     </span>
-                    <span class="model-id">ID: {{ model.id }}</span>
                     <span v-if="model.createdAt" class="model-time">时间：{{ formatModelTime(model.createdAt) }}</span>
                     <span v-if="editingModelConfigs.some((config) => config.modelId === model.id)" class="model-time">已设置 LLM 专属配置</span>
                   </span>
@@ -634,6 +644,22 @@ function cancelThinkingTest(): void {
   display: flex;
   align-items: center;
   gap: var(--space-1);
+}
+
+.model-identity-tooltip {
+  flex: 1;
+}
+
+.model-identity-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.model-identity-tooltip:focus-visible {
+  outline: 1px solid var(--vscode-panel-border);
+  outline-offset: 2px;
 }
 
 .model-probe-tag {

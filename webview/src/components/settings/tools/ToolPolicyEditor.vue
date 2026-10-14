@@ -798,7 +798,7 @@ function inputNumber(event: Event): number {
                             <span class="permission-desc">工具生成可预览的修改提案时，自动触发聊天卡片里的“查看差异”。</span>
                           </span>
                         </LcCheckbox>
-                        <div v-if="!toolGateValue(tool, 'autoSubmitResult')" class="tool-permission-card">
+                        <div v-if="!toolGateValue(tool, 'autoSubmitResult')" class="tool-permission-card tool-result-blocked-card">
                           <span class="permission-copy">
                             <span class="permission-title">此工具当前被阻止执行</span>
                             <span class="permission-desc">已有配置关闭了结果回传；当前不支持回传前询问，因此工具不会执行。</span>
@@ -1532,6 +1532,25 @@ function inputNumber(event: Event): number {
   color: inherit;
   appearance: none;
   -webkit-appearance: none;
+}
+
+.tool-result-blocked-card {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.tool-result-blocked-card button {
+  align-self: flex-start;
+  margin-top: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--vscode-panel-border);
+  background: transparent;
+  color: var(--vscode-foreground);
+}
+
+.tool-result-blocked-card button:hover:not(:disabled),
+.tool-result-blocked-card button:focus-visible {
+  background: var(--vscode-list-hoverBackground);
+  outline: 1px solid var(--vscode-panel-border);
 }
 
 .tool-permission-card.is-enabled {

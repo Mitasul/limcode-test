@@ -40,7 +40,7 @@ const supportedDefinitions = computed(() => {
   const thinking = thinkingCapability.value;
   const capability = capabilities.value;
   return parameterDefinitionsForProvider(props.config.provider, props.config.model, capability).filter(definition => {
-    if (['temperature', 'topP', 'topK'].includes(definition.key)
+    if (definition.key === 'topK'
       && props.config.provider === 'claude' && anthropicRejectsNonDefaultSampling(props.config.model)) return false;
     if (definition.path[0] !== 'thinkingConfig') return true;
     if (props.config.provider === 'openai-compatible'
@@ -51,7 +51,6 @@ const supportedDefinitions = computed(() => {
     }
     return Boolean(thinking) || capability.reasoning.family !== 'none' || capability.source === 'unknown';
   }).map(definition => {
-    if (definition.key === 'maxOutputTokens') return { ...definition, label: '最大输出 Token' };
     if (definition.key === 'thinkingBudget' && thinking && 'min' in thinking) {
       return { ...definition, description: `预算范围 ${thinking.min}–${thinking.max} Token。${thinking.automatic !== undefined ? ` ${thinking.automatic} 使用自动预算。` : ''}${thinking.allowZero ? ' 0 关闭思考。' : ''}留空使用模型默认。` };
     }
@@ -71,7 +70,7 @@ const definitions = computed(() => {
       result.push({ ...definition, label: `${definition.label}（未确认支持）`, options: [], description: '当前模型未确认支持；已保存值保留供检查或清除。' });
     }
   }
-  const order = ['thinkingLevel', 'thinkingBudget', 'reasoningMode', 'maxOutputTokens', 'temperature', 'topP', 'topK', 'includeThoughts'];
+  const order = ['thinkingLevel', 'thinkingBudget', 'reasoningMode', 'topK', 'includeThoughts'];
   return result.sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key));
 });
 const hasRequestBody = computed(() => Object.keys(requestBody.value).length > 0);
@@ -265,9 +264,12 @@ function uniqueKey(base: string, existingKeys: string[]): string {
 
 <template>
   <section v-if="section !== 'request-body'" class="llm-generation-settings" aria-label="生成参数">
-    <LlmKnownParameterRow v-for="definition in definitions" :key="definition.key"
-      :definition="definition" :model-value="getPathValue(generationConfig, definition.path)"
-      @update:model-value="updateKnownValue(definition, $event)" @remove="removeKnownParameter(definition)" />
+    <div class="global-settings-grid">
+      <slot name="before-generation-fields" />
+      <LlmKnownParameterRow v-for="definition in definitions" :key="definition.key"
+        :definition="definition" :model-value="getPathValue(generationConfig, definition.path)"
+        @update:model-value="updateKnownValue(definition, $event)" @remove="removeKnownParameter(definition)" />
+    </div>
     <LlmSettingHint :text="`思考：${thinkingLabel}`" details="未设置时不发送覆盖参数，由模型决定；关闭会发送明确的关闭设置。未知兼容端点的手工参数未经验证。" />
     <p v-if="jsonError" class="llm-json-error" role="alert">{{ jsonError }}</p>
   </section>
@@ -328,7 +330,7 @@ function uniqueKey(base: string, existingKeys: string[]): string {
 </template>
 
 <style scoped>
-.llm-generation-settings { display: grid; gap: var(--space-1); min-width: 0; }
+.llm-generation-settings { display: grid; gap: var(--space-2); min-width: 0; }
 .llm-json-shell { position: relative; }
 .llm-json-editor { scrollbar-width: none; }
 .llm-json-editor::-webkit-scrollbar { display: none; }

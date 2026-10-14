@@ -33,6 +33,7 @@ const emit = defineEmits<{
 }>();
 
 const draft = ref('');
+const touched = ref(false);
 const inputElement = ref<HTMLInputElement>();
 const panelId = `input-panel-${Math.random().toString(36).slice(2)}`;
 const inputId = `${panelId}-input`;
@@ -41,14 +42,15 @@ const errorId = `${panelId}-error`;
 
 const trimmedDraft = computed(() => draft.value.trim());
 const errorText = computed(() => {
-  if (props.required && !trimmedDraft.value) return '标题不能为空';
+  if (props.required && !trimmedDraft.value) return `${props.label || '内容'}不能为空`;
   return props.validate?.(trimmedDraft.value) ?? '';
 });
 const canConfirm = computed(() => !errorText.value);
+const visibleError = computed(() => touched.value ? errorText.value : '');
 const describedBy = computed(() => {
   const ids: string[] = [];
   if (props.description) ids.push(descriptionId);
-  if (errorText.value) ids.push(errorId);
+  if (visibleError.value) ids.push(errorId);
   return ids.join(' ') || undefined;
 });
 
@@ -57,6 +59,7 @@ watch(
   ([open, initialValue]) => {
     if (!open) return;
     draft.value = initialValue ?? '';
+    touched.value = false;
     void nextTick(() => {
       inputElement.value?.focus();
       inputElement.value?.select();
@@ -70,6 +73,7 @@ function cancel(): void {
 }
 
 function confirm(): void {
+  touched.value = true;
   if (!canConfirm.value) {
     inputElement.value?.focus();
     return;
@@ -79,6 +83,7 @@ function confirm(): void {
 
 function updateDraft(event: Event): void {
   draft.value = (event.target as HTMLInputElement).value;
+  touched.value = true;
 }
 
 function onKeydown(event: KeyboardEvent): void {
@@ -115,15 +120,18 @@ function onKeydown(event: KeyboardEvent): void {
             :id="inputId"
             ref="inputElement"
             class="input-panel-input"
-            :class="{ invalid: !!errorText }"
+            :class="{ invalid: !!visibleError }"
+            :aria-invalid="!!visibleError"
+            :aria-describedby="visibleError ? errorId : undefined"
             :value="draft"
             :placeholder="placeholder"
             type="text"
             autocomplete="off"
             spellcheck="false"
             @input="updateDraft"
+            @blur="touched = true"
           />
-          <p v-if="errorText" :id="errorId" class="input-panel-error">{{ errorText }}</p>
+          <p v-if="visibleError" :id="errorId" class="input-panel-error">{{ visibleError }}</p>
         </div>
 
         <div v-if="$slots.default" class="input-panel-extra">

@@ -154,6 +154,8 @@
 }
 
 .model-manager-header label {
+  flex: none;
+  white-space: nowrap;
   color: var(--vscode-foreground);
   font-size: var(--font-size-sm);
   font-weight: 600;
@@ -416,6 +418,11 @@ button.model-remove-btn:active {
 }
 
 @media (max-width: 560px) {
+  .model-manager-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
   .global-settings-grid {
     grid-template-columns: 1fr;
   }

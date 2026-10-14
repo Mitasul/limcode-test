@@ -397,11 +397,8 @@ test('专业参数编辑挂载不写默认，数值清空不落为0，思考档�
   const parameterMount = f.mount('Parameters', { config, 'onUpdate-generation-config': value => emitted.push(value) });
   const parameters = parameterMount.view;
   assert.equal(emitted.length, 0);
-  const temperature = parameters.definitions.find(item => item.key === 'temperature');
-  parameters.updateKnownValue(temperature, 0.2);
-  assert.deepEqual(emitted.pop(), { temperature: 0.2 });
-  parameters.updateKnownValue(temperature, undefined);
-  assert.equal(emitted.pop(), undefined);
+  const removedKeys = ['maxOutputTokens', 'temperature', 'topP'];
+  assert.ok(parameters.definitions.every(item => !removedKeys.includes(item.key)));
   const thinking = parameters.definitions.find(item => item.key === 'thinkingLevel');
   assert.ok(thinking.options.every(item => !['none', 'minimal'].includes(item.value)));
   const advanced = f.mount('Advanced', { config,
@@ -417,10 +414,24 @@ test('专业参数编辑挂载不写默认，数值清空不落为0，思考档�
   assert.equal(parameters.jsonDraft, '{bad', '失焦后迟到快照不能覆盖无效JSON草稿');
   parameters.resetJsonDraft();
   assert.deepEqual(JSON.parse(parameters.jsonDraft), { peer: true });
-  await parameterMount.setProps({ config: { ...config, provider: 'claude', baseUrl: 'https://api.anthropic.com',
-    model: 'claude-sonnet-4-5', generationConfig: { maxOutputTokens: 4096 } } });
+  const saved = { maxOutputTokens: 4096, temperature: 0.2, topP: 0.9 };
+  for (const [provider, model, baseUrl] of [
+    ['openai-responses', 'gpt-6-astra', 'https://api.openai.com/v1'],
+    ['openai-compatible', 'deepseek-chat', 'https://api.deepseek.com/v1'],
+    ['gemini', 'gemini-2.5-pro', 'https://generativelanguage.googleapis.com'],
+    ['claude', 'claude-sonnet-4-5', 'https://api.anthropic.com']
+  ]) {
+    await parameterMount.setProps({ config: { ...config, provider, model, baseUrl, generationConfig: saved } });
+    assert.ok(parameters.definitions.every(item => !removedKeys.includes(item.key)), `${provider}不重新显示已移除的控件`);
+  }
+  assert.equal(emitted.length, 0, '移除界面入口不能改写已有配置');
+  const topK = parameters.definitions.find(item => item.key === 'topK');
+  parameters.updateKnownValue(topK, 40);
+  assert.deepEqual(emitted.pop(), { ...saved, topK: 40 });
+  parameters.updateKnownValue(topK, undefined);
+  assert.deepEqual(emitted.pop(), saved);
   const claudeThinking = parameters.definitions.find(item => item.key === 'thinkingLevel');
   assert.deepEqual(claudeThinking.options.map(item => item.value), ['none'], '预算模型仍可显式关闭思考');
   parameters.updateKnownValue(claudeThinking, 'none');
-  assert.deepEqual(emitted.pop(), { maxOutputTokens: 4096, thinkingConfig: { thinkingLevel: 'none' } });
+  assert.deepEqual(emitted.pop(), { ...saved, thinkingConfig: { thinkingLevel: 'none' } });
 });

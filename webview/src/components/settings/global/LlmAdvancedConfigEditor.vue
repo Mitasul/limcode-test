@@ -356,25 +356,27 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
     <section class="config-section" aria-label="生成与上下文">
       <h3>生成与上下文</h3>
       <div class="global-settings-grid">
-        <label class="global-settings-field context-window-field">
-          <span>上下文容量（Token）</span>
-          <input
-            class="token-number-input"
-            :value="config.contextWindowTokens ?? ''"
-            type="number"
-            min="1000"
-            :step="TOKEN_STEP"
-            placeholder="未设置（使用模型容量）"
-            aria-label="上下文容量（Token）"
-            @change="updateContextWindowTokens"
-          />
-        </label>
-
         <LlmParameterSettings
           class="global-settings-field-wide"
           :config="config"
           @update-generation-config="emit('update-generation-config', $event)"
-        />
+        >
+          <template #before-generation-fields>
+            <label class="global-settings-field context-window-field">
+              <span>上下文容量（Token）</span>
+              <input
+                class="token-number-input"
+                :value="config.contextWindowTokens ?? ''"
+                type="number"
+                min="1000"
+                :step="TOKEN_STEP"
+                placeholder="未设置（使用模型容量）"
+                aria-label="上下文容量（Token）"
+                @change="updateContextWindowTokens"
+              />
+            </label>
+          </template>
+        </LlmParameterSettings>
 
         <div class="global-settings-field stream-field">
           <span>流式生成</span>
@@ -714,6 +716,12 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
 
 .stream-field {
   justify-content: start;
+}
+
+.context-window-field > span {
+  min-height: 26px;
+  display: flex;
+  align-items: center;
 }
 
 .system-prompt-prefix-shell {

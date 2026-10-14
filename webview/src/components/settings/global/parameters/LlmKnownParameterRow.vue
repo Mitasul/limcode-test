@@ -92,21 +92,31 @@ function updateEnum(value: string): void {
 
 <style scoped>
 .known-parameter-row {
-  padding: var(--space-1) 0;
+  min-width: 0;
   display: grid;
-  grid-template-columns: minmax(80px, 1fr) minmax(0, 220px) 26px;
-  gap: var(--space-2);
+  grid-template-columns: minmax(0, 1fr) 26px;
+  grid-template-areas: 'label remove' 'control control';
+  gap: var(--space-1) var(--space-2);
   align-items: center;
+  font-size: var(--font-size-sm);
 }
 
 .known-parameter-info {
+  grid-area: label;
   min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 
+.known-parameter-info :deep(.llm-setting-hint) {
+  color: var(--vscode-foreground);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
 .known-parameter-control {
+  grid-area: control;
   min-width: 0;
 }
 
@@ -134,6 +144,7 @@ function updateEnum(value: string): void {
 }
 
 .known-parameter-remove {
+  grid-area: remove;
   width: 26px;
   height: 26px;
   border: 0;

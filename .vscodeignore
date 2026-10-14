@@ -76,6 +76,7 @@ README copy.md
 !dist/**/*.json
 
 dist/**/*.map
+dist/visual-acceptance*/**
 
 # CI reports are never extension runtime assets.
 test-results/**

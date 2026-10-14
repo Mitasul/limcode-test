@@ -31,7 +31,6 @@ interface ProviderParameterDisplay {
   description?: string;
 }
 
-const ALL_PROVIDERS = ['openai-compatible', 'openai-responses', 'claude', 'gemini'] as const satisfies readonly LlmProviderKind[];
 const GEMINI_CLAUDE = ['gemini', 'claude'] as const satisfies readonly LlmProviderKind[];
 const REASONING_MODE_OPTIONS = [
   { value: 'standard', label: '标准' },
@@ -41,19 +40,13 @@ const REASONING_MODE_OPTIONS = [
 
 const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, ProviderParameterDisplay>> = {
   gemini: {
-    temperature: { path: 'generationConfig.temperature' },
-    topP: { path: 'generationConfig.topP' },
     topK: { path: 'generationConfig.topK' },
-    maxOutputTokens: { path: 'generationConfig.maxOutputTokens' },
     includeThoughts: { path: 'generationConfig.thinkingConfig.includeThoughts' },
     thinkingBudget: { path: 'generationConfig.thinkingConfig.thinkingBudget' },
     thinkingLevel: { path: 'generationConfig.thinkingConfig.thinkingLevel', label: 'Thinking Level' }
   },
   claude: {
-    temperature: { path: 'temperature' },
-    topP: { path: 'top_p', label: 'Top P / top_p' },
     topK: { path: 'top_k', label: 'Top K / top_k' },
-    maxOutputTokens: { path: 'max_tokens', label: 'Max Tokens' },
     thinkingBudget: {
       path: 'thinking.budget_tokens',
       label: '思考预算',
@@ -66,9 +59,6 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
     }
   },
   'openai-compatible': {
-    temperature: { path: 'temperature' },
-    topP: { path: 'top_p', label: 'Top P / top_p' },
-    maxOutputTokens: { path: 'max_tokens', label: 'Max Tokens' },
     thinkingLevel: {
       path: 'reasoning_effort / thinking.type / enable_thinking',
       label: '思考强度',
@@ -76,9 +66,6 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
     }
   },
   'openai-responses': {
-    temperature: { path: 'temperature' },
-    topP: { path: 'top_p', label: 'Top P / top_p' },
-    maxOutputTokens: { path: 'max_output_tokens', label: 'Max Output Tokens' },
     reasoningMode: {
       path: 'reasoning.mode',
       label: '推理模式',
@@ -94,24 +81,6 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
 
 export const LLM_PARAMETER_DEFINITIONS: readonly BaseLlmParameterDefinition[] = [
   {
-    key: 'temperature',
-    path: ['temperature'],
-    label: 'Temperature',
-    description: '控制输出随机性，值越高越发散。',
-    valueType: 'number',
-    defaultValue: 0.7,
-    providers: ALL_PROVIDERS
-  },
-  {
-    key: 'topP',
-    path: ['topP'],
-    label: 'Top P',
-    description: '核采样阈值，通常取 0-1。',
-    valueType: 'number',
-    defaultValue: 0.9,
-    providers: ALL_PROVIDERS
-  },
-  {
     key: 'topK',
     path: ['topK'],
     label: 'Top K',
@@ -119,15 +88,6 @@ export const LLM_PARAMETER_DEFINITIONS: readonly BaseLlmParameterDefinition[] = 
     valueType: 'number',
     defaultValue: 40,
     providers: GEMINI_CLAUDE
-  },
-  {
-    key: 'maxOutputTokens',
-    path: ['maxOutputTokens'],
-    label: '最大输出 Token',
-    description: '限制单次回复输出的 Token 数。',
-    valueType: 'number',
-    defaultValue: 1024,
-    providers: ALL_PROVIDERS
   },
   {
     key: 'includeThoughts',
