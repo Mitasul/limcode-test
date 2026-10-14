@@ -633,8 +633,6 @@ function updateFallback(value: LlmCompressionFallbackKind, enabled: boolean): vo
           aria-label="信任当前兼容端点支持 Provider 原生压缩" @update:model-value="updateNativeTrustMode">
           信任端点声明
         </LcCheckbox>
-        <LlmSettingHint v-if="canDeclareNativeCapability" text="显式信任不等于在线验证。"
-          details="只对当前渠道和模型生效；404、405、501 或契约错误仍会停用本次原生尝试并进入后备链。" />
       </div>
       <section class="compression-fallback-list global-settings-field-wide" aria-label="压缩后备策略">
         <span class="compression-trigger-title">失败后依次尝试</span>
