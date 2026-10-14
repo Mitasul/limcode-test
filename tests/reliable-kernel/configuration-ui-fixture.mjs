@@ -8,6 +8,10 @@ const vue = require('vue'), pinia = require('pinia'), ts = require('typescript')
 const { parse, compileScript } = require('@vue/compiler-sfc');
 const sourceRoot = path.resolve('webview/src');
 const componentFiles = {
+  Channel: path.join(sourceRoot, 'components/settings/global/ChannelSettingsTab.vue'),
+  ChannelEditor: path.join(sourceRoot, 'components/settings/global/ChannelConfigEditor.vue'),
+  Advanced: path.join(sourceRoot, 'components/settings/global/LlmAdvancedConfigEditor.vue'),
+  Parameters: path.join(sourceRoot, 'components/settings/global/parameters/LlmParameterSettings.vue'),
   Prompt: path.join(sourceRoot, 'components/settings/config/SystemPromptScopeEditor.vue'),
   Model: path.join(sourceRoot, 'components/settings/config/ModelProfileScopeEditor.vue'),
   Thinking: path.join(sourceRoot, 'components/input/SessionThinkingControl.vue'),
@@ -108,7 +112,10 @@ export async function createConfigurationUiGraph() {
           const component = { ...load(componentFiles[name]).default, render() { return null; } };
           const app = renderer.createApp(component, props).use(isolated), root = node('root');
           app.provide(vue.ssrContextKey, { modules: new Set() });
-          const instance = app.mount(root); apps.push(app); return { view: instance.$.setupState, root };
+          const instance = app.mount(root); apps.push(app);
+          return { view: instance.$.setupState, root,
+            async setProps(next) { Object.assign(instance.$.props, next); await vue.nextTick(); }
+          };
         },
         messagesOf(type) { return active.messages.filter(message => message.type === type); },
         last(type) { return f.messagesOf(type).at(-1); }

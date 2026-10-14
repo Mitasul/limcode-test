@@ -3,6 +3,7 @@ import { computed } from 'vue';
 import { IconTrash } from '@tabler/icons-vue';
 import SettingsDropdown, { type SettingsDropdownOption } from '../SettingsDropdown.vue';
 import type { LlmParameterDefinition } from './llmParameterDefinitions';
+import LlmSettingHint from './LlmSettingHint.vue';
 
 const props = defineProps<{
   definition: LlmParameterDefinition;
@@ -15,17 +16,22 @@ const emit = defineEmits<{
 }>();
 
 const numberValue = computed(() => typeof props.modelValue === 'number' && Number.isFinite(props.modelValue) ? String(props.modelValue) : '');
-const booleanValue = computed(() => props.modelValue === false ? 'false' : 'true');
-const enumValue = computed(() => typeof props.modelValue === 'string' ? props.modelValue : String(props.definition.defaultValue ?? ''));
+const UNSET = '__unset__';
+const booleanValue = computed(() => typeof props.modelValue === 'boolean' ? String(props.modelValue) : UNSET);
+const enumValue = computed(() => typeof props.modelValue === 'string' && props.modelValue !== 'not-set' ? props.modelValue : UNSET);
+const unsetOption = { value: UNSET, label: '未设置（模型默认）', description: '不发送该参数；与显式关闭不同。' };
 const booleanOptions: SettingsDropdownOption[] = [
+  unsetOption,
   { value: 'true', label: '是', description: '发送 true' },
   { value: 'false', label: '否', description: '发送 false' }
 ];
-const enumOptions = computed<SettingsDropdownOption[]>(() => (props.definition.options ?? []).map((option) => ({
-  value: option.value,
-  label: option.label,
-  description: option.description
-})));
+const enumOptions = computed<SettingsDropdownOption[]>(() => {
+  const options: SettingsDropdownOption[] = [unsetOption, ...(props.definition.options ?? []).filter(option => option.value !== 'not-set')];
+  if (enumValue.value !== UNSET && !options.some(option => option.value === enumValue.value)) {
+    options.push({ value: enumValue.value, label: `${enumValue.value}（已保存，当前不支持）`, disabled: true });
+  }
+  return options;
+});
 
 function updateNumber(event: Event): void {
   const raw = (event.target as HTMLInputElement).value.trim();
@@ -38,20 +44,18 @@ function updateNumber(event: Event): void {
 }
 
 function updateBoolean(value: string): void {
-  emit('update:modelValue', value === 'true');
+  emit('update:modelValue', value === UNSET ? undefined : value === 'true');
 }
 
 function updateEnum(value: string): void {
-  emit('update:modelValue', value);
+  emit('update:modelValue', value === UNSET ? undefined : value);
 }
 </script>
 
 <template>
-  <article class="known-parameter-row">
+  <article class="known-parameter-row" :data-parameter="definition.key">
     <div class="known-parameter-info">
-      <span class="known-parameter-label">{{ definition.label }}</span>
-      <span class="known-parameter-path">{{ definition.displayPath }}</span>
-      <span class="known-parameter-description">{{ definition.description }}</span>
+      <LlmSettingHint :text="definition.label" :details="`${definition.description} 请求字段：${definition.displayPath}`" />
     </div>
 
     <div class="known-parameter-control">
@@ -60,7 +64,8 @@ function updateEnum(value: string): void {
         :value="numberValue"
         type="number"
         step="any"
-        placeholder="输入数字"
+        placeholder="未设置（模型默认）"
+        :aria-label="definition.label"
         @input="updateNumber"
       />
       <SettingsDropdown
@@ -79,7 +84,7 @@ function updateEnum(value: string): void {
       />
     </div>
 
-    <button type="button" class="known-parameter-remove" aria-label="移除参数" @click="emit('remove')">
+    <button type="button" class="known-parameter-remove" :disabled="modelValue === undefined" :aria-label="`清除${definition.label}`" @click="emit('remove')">
       <IconTrash stroke="2" aria-hidden="true" />
     </button>
   </article>
@@ -87,14 +92,11 @@ function updateEnum(value: string): void {
 
 <style scoped>
 .known-parameter-row {
-  border: 1px solid var(--vscode-panel-border);
-  border-radius: var(--radius-sm);
-  padding: var(--space-2);
+  padding: var(--space-1) 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(150px, 220px) 26px;
+  grid-template-columns: minmax(80px, 1fr) minmax(0, 220px) 26px;
   gap: var(--space-2);
   align-items: center;
-  background: color-mix(in srgb, var(--vscode-editor-background) 96%, var(--vscode-foreground) 4%);
 }
 
 .known-parameter-info {
@@ -104,28 +106,13 @@ function updateEnum(value: string): void {
   gap: 2px;
 }
 
-.known-parameter-label {
-  color: var(--vscode-foreground);
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-}
-
-.known-parameter-path,
-.known-parameter-description {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--vscode-descriptionForeground);
-  font-size: var(--font-size-xs);
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
 .known-parameter-control {
   min-width: 0;
 }
 
 .known-parameter-control input {
   width: 100%;
+  box-sizing: border-box;
   min-height: 30px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
@@ -171,14 +158,4 @@ function updateEnum(value: string): void {
   height: 14px;
 }
 
-@media (max-width: 680px) {
-  .known-parameter-row {
-    grid-template-columns: 1fr 26px;
-  }
-
-  .known-parameter-control {
-    grid-column: 1 / -1;
-    order: 3;
-  }
-}
 </style>

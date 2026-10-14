@@ -1002,8 +1002,6 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
       </div>
 
       <div class="settings-content">
-        <p class="settings-nav-intro">这个入口只负责导航到不同设置范围，具体配置仍在各自设置页中完成。</p>
-
         <nav class="settings-nav-list" aria-label="设置范围">
           <button type="button" class="settings-nav-card" @click="openGlobalSettings">
             <span class="settings-nav-icon" aria-hidden="true">
@@ -1053,16 +1051,7 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
             </span>
           </button>
 
-          <button type="button" class="settings-nav-card is-disabled" disabled>
-            <span class="settings-nav-icon" aria-hidden="true">
-              <IconMessage class="settings-gear-icon" stroke="2" />
-            </span>
-            <span class="settings-nav-main">
-              <span class="settings-nav-title">对话设置</span>
-              <span class="settings-nav-desc">单个对话的名称、LLM 选择、工具策略与上下文配置。</span>
-            </span>
-            <span class="settings-nav-badge">即将支持</span>
-          </button>
+
         </nav>
 
         <div class="settings-actions">

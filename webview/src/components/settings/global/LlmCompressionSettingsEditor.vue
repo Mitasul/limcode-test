@@ -25,6 +25,8 @@ import {
   resolveSummaryReasoning
 } from '@shared/modelCapabilities';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
+import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
+import LlmSettingHint from './parameters/LlmSettingHint.vue';
 import LlmSummaryGenerationEditor from './LlmSummaryGenerationEditor.vue';
 import TokenThresholdSlider from '@webview/components/ui/TokenThresholdSlider.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from './SettingsDropdown.vue';
@@ -233,6 +235,14 @@ const summaryReasoningPlan = computed(() => capabilities.value
   : undefined
 );
 
+const summaryReasoningOptions = computed<SettingsDropdownOption[]>(() => SUMMARY_REASONING_OPTIONS.map(option => {
+  if (!capabilities.value || option.value === 'explicit' || option.value === 'inherit_chat') return option;
+  const plan = resolveSummaryReasoning({ mode: option.value as LlmSummaryReasoningMode,
+    methodGenerationConfig: props.config?.llmSummary?.generationConfig,
+    inheritedGenerationConfig: inheritedGenerationConfig.value, capabilities: capabilities.value });
+  return { ...option, disabled: plan.status === 'unsupported', description: plan.description };
+}));
+
 const providerConfigOptions = computed<SettingsDropdownOption[]>(() => [
   {
     value: '__current__',
@@ -329,7 +339,6 @@ const compressionBodyTargetTokens = computed(() => clampBodyTargetTokens(
 const recommendedBodyTargetTokens = computed(() => clampBodyTargetTokens(
   DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS
 ));
-const compressionBodyTargetLabel = computed(() => formatTokenLabel(compressionBodyTargetTokens.value));
 const compressionBodyTargetInputValue = computed(() => String(compressionBodyTargetTokens.value || ''));
 const compressionMaxDurationMinutes = computed(() => normalizeLlmCompressionMaxDurationMinutes(props.config?.maxDurationMinutes));
 const configuredFallbacks = computed<LlmCompressionFallbackKind[]>(() =>
@@ -498,155 +507,17 @@ function updateFallback(value: LlmCompressionFallbackKind, enabled: boolean): vo
 <template>
   <section class="compression-settings" aria-label="上下文压缩">
     <header class="compression-settings-header">
-      <div>
-        <label>上下文压缩</label>
-        <p>
-          当前策略：{{ compressionKindLabel(config?.kind) }}。文字压缩后的对话主体目标为
-          {{ compressionBodyTargetLabel }} Token；能力、推理映射与后备链会在每次模型请求建立时冻结。
-        </p>
-      </div>
-      <button v-if="providerConfig && ['openai-responses', 'claude'].includes(providerConfig.provider)"
-        type="button" class="settings-native-probe"
-        @click="emit('verify-native', providerConfig.id, providerModelId)">
-        验证原生端点（会调用一次）
-      </button>
+      <LcCheckbox :model-value="compressionAutoEnabled" aria-label="启用自动压缩"
+        @update:model-value="updateCompressionAutoEnabled">自动压缩</LcCheckbox>
+      <LlmSettingHint :text="`当前策略：${compressionKindLabel(config?.kind ?? 'auto')}`"
+        details="达到完整输入阈值时准备压缩。关闭自动触发后，仍可手动压缩。设置在后续请求建立时生效。" />
     </header>
-
     <div class="global-settings-grid compression-settings-grid">
-      <label class="global-settings-field">
-        <span>压缩使用的模型渠道</span>
-        <SettingsDropdown
-          v-model="providerConfigId"
-          :options="providerConfigOptions"
-          title="选择压缩使用的渠道配置"
-          searchable
-          search-placeholder="筛选渠道..."
-        />
-      </label>
-
-      <label class="global-settings-field">
-        <span>压缩策略</span>
-        <SettingsDropdown
-          :model-value="activeMethodKind"
-          :options="methodOptions"
-          title="选择压缩策略"
-          @update:model-value="updateMethodKind"
-        />
-      </label>
-
-      <section class="compression-capability-panel global-settings-field-wide" aria-label="压缩能力与实际执行">
-        <div class="compression-trigger-head">
-          <div>
-            <span class="compression-trigger-title">能力与实际执行</span>
-            <p>能力按渠道类型、Base URL 和模型 ID 解析；未知兼容端点不会被当成官方端点。</p>
-          </div>
-          <span
-            class="compression-capability-badge"
-            :class="{ 'is-available': nativeAvailable, 'is-unavailable': !nativeAvailable }"
-          >
-            {{ nativeCapabilityLabel }}
-          </span>
-        </div>
-
-        <dl class="compression-capability-grid">
-          <div>
-            <dt>渠道 / 模型</dt>
-            <dd>{{ providerLabel(providerConfig?.provider) }} · {{ providerModelId || '未选择模型' }}</dd>
-          </div>
-          <div>
-            <dt>能力来源</dt>
-            <dd>{{ capabilitySourceLabel }}<span v-if="capabilities?.verifiedAt"> · {{ capabilities.verifiedAt }}</span></dd>
-          </div>
-          <div>
-            <dt>原生压缩</dt>
-            <dd>{{ capabilities?.nativeCompaction.reason ?? '尚未解析渠道能力。' }}</dd>
-          </div>
-          <div>
-            <dt>实际后备链</dt>
-            <dd>{{ executionPlanLabel }}</dd>
-          </div>
-        </dl>
-
-        <LcCheckbox
-          v-if="canDeclareNativeCapability"
-          :model-value="nativeTrustMode === 'trust_configured_endpoint'"
-          aria-label="信任当前兼容端点支持 Provider 原生压缩"
-          @update:model-value="updateNativeTrustMode"
-        >
-          <span class="compression-auto-text">
-            明确信任当前端点声明的原生压缩能力。启用后不代表已经实测；404、405、501
-            或契约错误仍会永久停用本次原生尝试并进入后备链。
-          </span>
-        </LcCheckbox>
-      </section>
-
-      <section class="compression-trigger-panel global-settings-field-wide" aria-label="总结模型推理设置">
-        <div class="compression-trigger-head">
-          <div>
-            <span class="compression-trigger-title">总结模型推理</span>
-            <p>配置表达意图，运行时按精确模型能力解析；系统不再暗中覆盖为 low。</p>
-          </div>
-        </div>
-        <label class="global-settings-field">
-          <span>推理意图</span>
-          <SettingsDropdown
-            :model-value="summaryReasoningMode"
-            :options="SUMMARY_REASONING_OPTIONS"
-            title="选择总结模型推理意图"
-            @update:model-value="updateSummaryReasoningMode"
-          />
-        </label>
-        <div class="compression-resolution">
-          <strong>实际映射</strong>
-          <span>{{ summaryReasoningPlan?.description ?? '尚未解析总结模型能力。' }}</span>
-          <code v-if="summaryReasoningPlan?.requestBody">
-            {{ JSON.stringify(summaryReasoningPlan.requestBody) }}
-          </code>
-        </div>
-        <LlmSummaryGenerationEditor :value="config?.llmSummary?.generationConfig" :capabilities="capabilities"
-          :mode="summaryReasoningMode" :target-tokens="config?.llmSummary?.targetTokens"
-          @update="emit('update-summary-generation-config', $event)" />
-      </section>
-
-      <section class="compression-trigger-panel global-settings-field-wide" aria-label="压缩后备策略">
-        <div class="compression-trigger-head">
-          <div>
-            <span class="compression-trigger-title">后备策略</span>
-            <p>按以下固定顺序执行；每个方法都有独立、可恢复的 ModelRequest 身份。</p>
-          </div>
-        </div>
-        <div class="compression-fallback-list">
-          <LcCheckbox
-            v-for="option in FALLBACK_OPTIONS"
-            :key="option.value"
-            :model-value="fallbackEnabled(option.value)"
-            :aria-label="option.label"
-            @update:model-value="updateFallback(option.value, $event)"
-          >
-            <span class="compression-fallback-copy">
-              <strong>{{ option.label }}</strong>
-              <small>{{ option.description }}</small>
-            </span>
-          </LcCheckbox>
-        </div>
-      </section>
-
-      <label class="global-settings-field global-settings-field-wide compression-auto-field">
-        <span>自动触发</span>
-        <LcCheckbox
-          :model-value="compressionAutoEnabled"
-          aria-label="启用完整输入阈值自动压缩"
-          @update:model-value="updateCompressionAutoEnabled"
-        >
-          <span class="compression-auto-text">启用后，当实际发送的完整输入达到阈值时准备压缩。</span>
-        </LcCheckbox>
-      </label>
-
       <div v-if="compressionAutoEnabled" class="compression-trigger-panel global-settings-field-wide">
         <div class="compression-trigger-head">
           <div>
             <span class="compression-trigger-title">完整输入 Token 触发阈值</span>
-            <p>完整输入包含系统要求、工具定义、运行提醒和对话；该值只决定何时压缩。</p>
+            <LlmSettingHint text="只决定何时压缩。" details="完整输入包含系统要求、工具定义、运行提醒和对话。" />
           </div>
         </div>
 
@@ -656,6 +527,7 @@ function updateFallback(value: LlmCompressionFallbackKind, enabled: boolean): vo
             <span class="threshold-input-shell">
               <input
                 class="token-number-input"
+                aria-label="压缩触发 Token"
                 :value="compressionThresholdInputValue"
                 type="number"
                 :min="TOKEN_STEP"
@@ -683,11 +555,9 @@ function updateFallback(value: LlmCompressionFallbackKind, enabled: boolean): vo
       <div class="compression-trigger-panel global-settings-field-wide">
         <div class="compression-trigger-head">
           <div>
-            <span class="compression-trigger-title">压缩后保留的对话 Token 数</span>
-            <p>
-              本地文字压缩后仍逐字发送的对话主体上限。默认
-              {{ formatTokenLabel(DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS) }}；实际值最多取触发阈值以下剩余空间的一半。
-            </p>
+            <span class="compression-trigger-title">保留原文 Token</span>
+            <LlmSettingHint text="逐字保留的对话正文，不是摘要长度。"
+              :details="`默认 ${formatTokenLabel(DEFAULT_LLM_COMPRESSION_BODY_TARGET_TOKENS)} Token；实际保留量最多取触发阈值以下剩余空间的一半。`" />
           </div>
         </div>
 
@@ -697,6 +567,7 @@ function updateFallback(value: LlmCompressionFallbackKind, enabled: boolean): vo
             <span class="threshold-input-shell">
               <input
                 class="token-number-input"
+                aria-label="保留原文 Token"
                 :value="compressionBodyTargetInputValue"
                 type="number"
                 :min="MIN_LLM_COMPRESSION_BODY_TARGET_TOKENS"
@@ -715,277 +586,88 @@ function updateFallback(value: LlmCompressionFallbackKind, enabled: boolean): vo
             :step-tokens="TOKEN_STEP"
             :recommended-tokens="recommendedBodyTargetTokens"
             :disabled="compressionBodyTargetMaxTokens <= 0"
-            aria-label="拖拽调整压缩后保留的对话 Token 数"
+            aria-label="拖拽调整保留原文 Token"
             @update:model-value="updateBodyTargetFromTokens"
           />
         </div>
       </div>
 
-      <div class="compression-trigger-panel global-settings-field-wide">
-        <div class="compression-trigger-head">
-          <div>
-            <span class="compression-trigger-title">单次压缩最长时间</span>
-            <p>
-              每个方法的单次尝试包含等待和生成；可设置 1–{{ MAX_LLM_COMPRESSION_DURATION_MINUTES }} 分钟，
-              默认 {{ DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES }} 分钟。
-            </p>
-          </div>
-        </div>
-        <label class="global-settings-field">
-          <span>最长时间</span>
-          <span class="threshold-input-shell">
-            <input
-              class="token-number-input"
-              :value="compressionMaxDurationMinutes"
-              type="number"
-              :min="1"
-              :max="MAX_LLM_COMPRESSION_DURATION_MINUTES"
-              :step="1"
-              aria-label="单次压缩最长时间（分钟）"
-              @change="updateMaxDurationMinutes"
-            />
-            <span>分钟</span>
-          </span>
-        </label>
+
+      <label class="global-settings-field">
+        <span>压缩策略</span>
+        <SettingsDropdown :model-value="activeMethodKind" :options="methodOptions" title="选择压缩策略"
+          @update:model-value="updateMethodKind" />
+      </label>
+      <label class="global-settings-field">
+        <span>压缩使用的模型渠道</span>
+        <SettingsDropdown v-model="providerConfigId" :options="providerConfigOptions"
+          title="选择压缩使用的渠道配置" searchable search-placeholder="筛选渠道..." />
+      </label>
+      <label class="global-settings-field">
+        <span>单次压缩最长时间（分钟）</span>
+        <input class="token-number-input" :value="compressionMaxDurationMinutes" type="number" :min="1"
+          :max="MAX_LLM_COMPRESSION_DURATION_MINUTES" :step="1" aria-label="单次压缩最长时间（分钟）"
+          @change="updateMaxDurationMinutes" />
+        <LlmSettingHint :text="`默认 ${DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES} 分钟，包含等待与生成。`" />
+      </label>
+      <div class="global-settings-field">
+        <span>摘要思考强度</span>
+        <SettingsDropdown :model-value="summaryReasoningMode" :options="summaryReasoningOptions"
+          title="选择总结模型推理意图" @update:model-value="updateSummaryReasoningMode" />
+        <LlmSettingHint text="按总结模型能力映射。" :details="summaryReasoningPlan?.description ?? '尚未解析总结模型能力。'" />
       </div>
+      <div class="global-settings-field compression-native-actions">
+        <HoverTooltipPanel panel-title="压缩能力与执行顺序" :rows="[
+          { label: '渠道 / 模型', value: `${providerLabel(providerConfig?.provider)} · ${providerModelId || '未选择'}` },
+          { label: '能力来源', value: capabilitySourceLabel },
+          { label: '原生压缩', value: capabilities?.nativeCompaction.reason ?? '尚未解析' },
+          { label: '执行顺序', value: executionPlanLabel }
+        ]">
+          <button type="button" class="compression-capability-badge">原生压缩：{{ nativeCapabilityLabel }}</button>
+        </HoverTooltipPanel>
+        <button v-if="providerConfig && ['openai-responses', 'claude'].includes(providerConfig.provider)"
+          type="button" class="settings-native-probe" @click="emit('verify-native', providerConfig.id, providerModelId)">
+          验证原生端点（会调用一次）
+        </button>
+        <LcCheckbox v-if="canDeclareNativeCapability" :model-value="nativeTrustMode === 'trust_configured_endpoint'"
+          aria-label="信任当前兼容端点支持 Provider 原生压缩" @update:model-value="updateNativeTrustMode">
+          信任端点声明
+        </LcCheckbox>
+        <LlmSettingHint v-if="canDeclareNativeCapability" text="显式信任不等于在线验证。"
+          details="只对当前渠道和模型生效；404、405、501 或契约错误仍会停用本次原生尝试并进入后备链。" />
+      </div>
+      <section class="compression-fallback-list global-settings-field-wide" aria-label="压缩后备策略">
+        <span class="compression-trigger-title">失败后依次尝试</span>
+        <div v-for="option in FALLBACK_OPTIONS" :key="option.value" class="compression-fallback-option">
+          <LcCheckbox :model-value="fallbackEnabled(option.value)" :aria-label="option.label"
+            @update:model-value="updateFallback(option.value, $event)">{{ option.label }}</LcCheckbox>
+          <LlmSettingHint text="说明" :details="option.description" />
+        </div>
+      </section>
+      <LlmSummaryGenerationEditor class="global-settings-field-wide" :value="config?.llmSummary?.generationConfig"
+        :capabilities="capabilities" :mode="summaryReasoningMode" :target-tokens="config?.llmSummary?.targetTokens"
+        @update="emit('update-summary-generation-config', $event)" />
     </div>
   </section>
 </template>
 
 <style scoped>
-.settings-native-probe { padding: var(--space-2); color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-sm); cursor: pointer; }
-.settings-native-probe:hover { background: var(--vscode-button-secondaryHoverBackground); }
-
-.compression-settings {
-  display: grid;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--vscode-panel-border);
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--vscode-editor-background) 94%, var(--vscode-editor-foreground) 6%);
-}
-
-.compression-settings-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
-}
-
-.compression-settings-header p {
-  margin: 2px 0 0;
-  color: var(--vscode-descriptionForeground);
-  font-size: var(--font-size-xs);
-  line-height: 1.5;
-}
-
-.compression-settings-grid {
-  margin: 0;
-}
-
-.compression-auto-text {
-  color: var(--vscode-descriptionForeground);
-  font-size: var(--font-size-xs);
-  line-height: 1.45;
-}
-
-.compression-capability-panel,
-.compression-trigger-panel {
-  display: grid;
-  gap: var(--space-3);
-  padding: var(--space-3);
-  border: 1px solid var(--vscode-panel-border);
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--vscode-editor-background) 97%, var(--vscode-foreground) 3%);
-}
-
-.compression-capability-panel {
-  border-color: color-mix(in srgb, var(--vscode-focusBorder, var(--vscode-panel-border)) 35%, var(--vscode-panel-border));
-}
-
-.compression-capability-badge {
-  flex: 0 0 auto;
-  padding: 2px 8px;
-  border: 1px solid var(--vscode-panel-border);
-  border-radius: 999px;
-  color: var(--vscode-descriptionForeground);
-  font-size: var(--font-size-xs);
-  white-space: nowrap;
-}
-
-.compression-capability-badge.is-available {
-  border-color: color-mix(in srgb, var(--vscode-testing-iconPassed, #73c991) 55%, var(--vscode-panel-border));
-  color: var(--vscode-testing-iconPassed, #73c991);
-}
-
-.compression-capability-badge.is-unavailable {
-  border-color: color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 55%, var(--vscode-panel-border));
-  color: var(--vscode-editorWarning-foreground, #cca700);
-}
-
-.compression-capability-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-2) var(--space-3);
-  margin: 0;
-}
-
-.compression-capability-grid > div {
-  min-width: 0;
-  padding: var(--space-2);
-  border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 72%, transparent);
-  border-radius: var(--radius-sm);
-}
-
-.compression-capability-grid dt {
-  color: var(--vscode-descriptionForeground);
-  font-size: var(--font-size-xs);
-}
-
-.compression-capability-grid dd {
-  margin: 3px 0 0;
-  color: var(--vscode-foreground);
-  font-size: var(--font-size-xs);
-  line-height: 1.45;
-  overflow-wrap: anywhere;
-}
-
-.compression-resolution {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: var(--space-1) var(--space-2);
-  align-items: start;
-  padding: var(--space-2);
-  border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 72%, transparent);
-  border-radius: var(--radius-sm);
-  color: var(--vscode-descriptionForeground);
-  font-size: var(--font-size-xs);
-}
-
-.compression-resolution strong {
-  color: var(--vscode-foreground);
-}
-
-.compression-resolution code {
-  grid-column: 2;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.compression-fallback-list {
-  display: grid;
-  gap: var(--space-2);
-}
-
-.compression-fallback-copy {
-  display: grid;
-  gap: 2px;
-}
-
-.compression-fallback-copy strong {
-  color: var(--vscode-foreground);
-  font-size: var(--font-size-sm);
-}
-
-.compression-fallback-copy small {
-  color: var(--vscode-descriptionForeground);
-  font-size: var(--font-size-xs);
-  line-height: 1.45;
-}
-
-.token-number-input[type='number'] {
-  appearance: textfield;
-  -moz-appearance: textfield;
-}
-
-.token-number-input[type='number']::-webkit-outer-spin-button,
-.token-number-input[type='number']::-webkit-inner-spin-button {
-  margin: 0;
-  -webkit-appearance: none;
-}
-
-.compression-auto-field {
-  padding-top: var(--space-1);
-  border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 72%, transparent);
-}
-
-.compression-trigger-head {
-  display: flex;
-  justify-content: space-between;
-  gap: var(--space-3);
-  align-items: flex-start;
-}
-
-.compression-trigger-title {
-  display: block;
-  color: var(--vscode-foreground);
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-}
-
-.compression-trigger-head p {
-  margin: 3px 0 0;
-  color: var(--vscode-descriptionForeground);
-  font-size: var(--font-size-xs);
-  line-height: 1.5;
-}
-
-.compression-threshold-control {
-  display: grid;
-  grid-template-columns: minmax(130px, 190px) minmax(0, 1fr);
-  gap: var(--space-3);
-  align-items: center;
-}
-
-.compression-threshold-input-field {
-  min-width: 0;
-}
-
-.threshold-input-shell {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
-  border-radius: var(--radius-sm);
-  background: var(--vscode-input-background);
-  color: var(--vscode-descriptionForeground);
-  overflow: hidden;
-}
-
-.threshold-input-shell input {
-  min-width: 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-}
-
-.threshold-input-shell input:focus {
-  outline: none;
-}
-
-.threshold-input-shell > span {
-  padding: 0 var(--space-2);
-  font-size: var(--font-size-xs);
-}
-
-@media (max-width: 720px) {
-  .compression-trigger-head,
-  .compression-threshold-control,
-  .compression-capability-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .compression-trigger-head {
-    display: grid;
-  }
-
-  .compression-resolution {
-    grid-template-columns: 1fr;
-  }
-
-  .compression-resolution code {
-    grid-column: 1;
-  }
-}
+.compression-settings { display: grid; gap: var(--space-2); padding-top: var(--space-2); min-width: 0; }
+.compression-settings-header { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); }
+.compression-settings-grid { margin: 0; }
+.compression-trigger-panel { display: grid; gap: var(--space-2); padding-block: var(--space-2); border-bottom: 1px solid var(--vscode-panel-border); }
+.compression-trigger-title { font-size: var(--font-size-sm); font-weight: 600; }
+.compression-trigger-head > div { display: grid; gap: var(--space-1); }
+.compression-native-actions { align-items: start; }
+.compression-capability-badge, .settings-native-probe { padding: var(--space-1) var(--space-2); background: transparent; color: var(--vscode-foreground); border: 1px solid var(--vscode-panel-border); border-radius: var(--radius-sm); font: inherit; cursor: pointer; }
+.compression-capability-badge:hover, .settings-native-probe:hover { background: var(--vscode-list-hoverBackground); }
+.compression-fallback-list { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-3); align-items: center; }
+.compression-fallback-option { display: inline-flex; gap: var(--space-1); align-items: center; }
+.compression-threshold-control { display: grid; grid-template-columns: minmax(130px, 190px) minmax(0, 1fr); gap: var(--space-3); align-items: center; }
+.threshold-input-shell { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: var(--radius-sm); background: var(--vscode-input-background); color: var(--vscode-descriptionForeground); }
+.threshold-input-shell input { min-width: 0; border: 0; border-radius: 0; background: transparent; }
+.threshold-input-shell > span { padding: 0 var(--space-2); font-size: var(--font-size-xs); }
+.token-number-input[type='number'] { appearance: textfield; -moz-appearance: textfield; }
+.token-number-input[type='number']::-webkit-outer-spin-button, .token-number-input[type='number']::-webkit-inner-spin-button { margin: 0; -webkit-appearance: none; }
+@media (max-width: 720px) { .compression-threshold-control { grid-template-columns: 1fr; } }
 </style>

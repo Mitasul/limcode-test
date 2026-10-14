@@ -28,7 +28,12 @@ export function useGuardedSettingsDraft<T extends DraftFields>(
   const dirty = computed(() => editRevision.value > acknowledgedEditRevision.value || !sameFields(value.value, saved.value));
   const remoteChanged = computed(() => dirty.value && externalChange.value);
   let scope: string | undefined;
-  let scopeRevision = 0;
+  // Only this editor's unsaved scopes survive object switches. Unmounting the settings view
+  // releases them; this is not a global conversation cache.
+  const draftsByScope = new Map<string, {
+    draft: T; saved: T; externalChange: boolean; editRevision: number;
+    acknowledgedEditRevision: number; submission: typeof submission.value;
+  }>();
 
   function reset(): void {
     const incoming = { ...readSaved() };
@@ -52,30 +57,50 @@ export function useGuardedSettingsDraft<T extends DraftFields>(
     if (!dirty.value) externalChange.value = false;
   }
 
-  /** Explicit reads may reset the draft only if nothing was edited or rebound while awaiting them. */
+  /** Explicit reads reset only their original scope, without overwriting later edits there. */
   function prepareReset(): () => void {
     const revision = editRevision.value;
-    const binding = scopeRevision;
+    const binding = scope;
     return () => {
-      if (revision === editRevision.value && binding === scopeRevision) reset();
+      if (scope === binding) {
+        if (revision === editRevision.value) reset();
+      } else if (binding !== undefined && draftsByScope.get(binding)?.editRevision === revision) {
+        draftsByScope.delete(binding);
+      }
     };
   }
 
   watch([readScope, readSaved], ([nextScope, incoming]) => {
     if (scope === nextScope && sameFields(saved.value, incoming)) return;
-    if (scope !== nextScope) scopeRevision++;
+    if (scope !== nextScope) {
+      if (scope !== undefined) {
+        if (dirty.value || submission.value) draftsByScope.set(scope, {
+          draft: { ...draft.value }, saved: { ...saved.value }, externalChange: externalChange.value,
+          editRevision: editRevision.value, acknowledgedEditRevision: acknowledgedEditRevision.value,
+          submission: submission.value
+        });
+        else draftsByScope.delete(scope);
+      }
+      const previous = draftsByScope.get(nextScope);
+      draftsByScope.delete(nextScope);
+      draft.value = { ...(previous?.draft ?? incoming) };
+      saved.value = { ...(previous?.saved ?? incoming) };
+      editRevision.value = previous?.editRevision ?? 0;
+      acknowledgedEditRevision.value = previous?.acknowledgedEditRevision ?? 0;
+      externalChange.value = previous?.externalChange ?? false;
+      submission.value = previous?.submission;
+      scope = nextScope;
+    }
     const sent = submission.value;
     const preserveSubmission = !!sent && (editRevision.value > sent.revision || !sameFields(sent.value, incoming));
-    if (scope !== nextScope || (!dirty.value && !preserveSubmission)) {
+    if (!dirty.value && !preserveSubmission) {
       draft.value = { ...incoming };
       acknowledgedEditRevision.value = editRevision.value;
       externalChange.value = false;
-    } else {
+    } else if (!sameFields(saved.value, incoming)) {
       externalChange.value = true;
     }
     saved.value = { ...incoming };
-    if (scope !== nextScope) submission.value = undefined;
-    scope = nextScope;
   }, { immediate: true, flush: 'sync' });
 
   return { value, dirty, remoteChanged, reset, markSubmitted, confirmSubmitted, prepareReset };

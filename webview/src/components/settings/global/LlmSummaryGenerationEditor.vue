@@ -3,8 +3,11 @@ import { ref, watch } from 'vue';
 import type { LlmGenerationConfigRecord, LlmSummaryReasoningMode } from '@shared/protocol';
 import { resolveSummaryReasoning, assertSummaryReasoningPlan, type ModelCapabilitySnapshot } from '@shared/modelCapabilities';
 import { resolveSummaryOutputBudget } from '@shared/summaryOutputBudget';
+import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
+import LlmSettingHint from './parameters/LlmSettingHint.vue';
 const props = defineProps<{ value?: LlmGenerationConfigRecord; capabilities?: ModelCapabilitySnapshot; mode: LlmSummaryReasoningMode; targetTokens?: number }>();
 const emit = defineEmits<{ (event: 'update', value: LlmGenerationConfigRecord | undefined): void }>();
+const scroller = ref<HTMLTextAreaElement | null>(null);
 const draft = ref('{}'); const error = ref(''); const editing = ref(false);
 watch(() => props.value, (value) => {
   if (!editing.value) draft.value = JSON.stringify(value ?? {}, null, 2);
@@ -39,14 +42,21 @@ function record(value: unknown): value is Record<string, unknown> { return Boole
 </script>
 <template>
   <details class="summary-generation-editor" :open="mode === 'explicit'">
-    <summary>高级摘要参数</summary>
-    <p>仅用于摘要请求。思考参数需选择“显式配置”才使用；Provider 默认不会继承聊天中的推理或采样覆盖。</p>
-    <textarea v-model="draft" aria-label="摘要 generationConfig JSON" rows="7" spellcheck="false" @input="editing = true" />
+    <summary>高级摘要 JSON</summary>
+    <LlmSettingHint text="仅用于摘要请求，不改变保留原文。"
+      details="思考参数需选择“高级原生配置”才使用；Provider 默认不会继承聊天中的推理或采样覆盖。" />
+    <div class="summary-json-shell">
+      <textarea ref="scroller" v-model="draft" aria-label="摘要 generationConfig JSON" rows="7" spellcheck="false" @input="editing = true" />
+      <AdvancedScrollbar :scroller="scroller" variant="minimal" />
+    </div>
     <p v-if="error" role="alert" class="summary-parameter-error">{{ error }}</p>
     <button type="button" @click="apply">应用摘要参数</button>
   </details>
 </template>
 <style scoped>
+.summary-json-shell { position: relative; margin-top: var(--space-2); }
+textarea { scrollbar-width: none; }
+textarea::-webkit-scrollbar { display: none; }
 .summary-generation-editor { min-width: 0; border-top: 1px solid var(--vscode-panel-border); padding-top: var(--space-2); }
 summary { cursor: pointer; font-size: var(--font-size-sm); }
 p { color: var(--vscode-descriptionForeground); font-size: var(--font-size-xs); line-height: 1.5; }

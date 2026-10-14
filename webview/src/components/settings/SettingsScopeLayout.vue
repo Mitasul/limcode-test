@@ -126,7 +126,7 @@ onBeforeUnmount(() => {
               :text="tab.loadingText?.() ?? '正在加载...'"
             />
           </span>
-          <span class="tab-description">{{ tab.description }}</span>
+
         </span>
       </button>
     </aside>
@@ -141,7 +141,9 @@ onBeforeUnmount(() => {
           @before-leave="() => (scrollbarFading = true)"
           @after-enter="() => (scrollbarFading = false)"
         >
-          <component v-if="activeTabComponent" :is="activeTabComponent" :key="activeTab" />
+          <KeepAlive>
+            <component v-if="activeTabComponent" :is="activeTabComponent" :key="activeTab" />
+          </KeepAlive>
         </Transition>
       </div>
 
@@ -275,15 +277,6 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.tab-description {
-  overflow: hidden;
-  color: var(--vscode-descriptionForeground);
-  font-size: var(--font-size-xs);
-  line-height: 1.3;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .settings-content-shell {
   position: relative;
   min-width: 0;
@@ -371,10 +364,6 @@ onBeforeUnmount(() => {
 
   .tab-label {
     white-space: nowrap;
-  }
-
-  .tab-description {
-    display: none;
   }
 }
 

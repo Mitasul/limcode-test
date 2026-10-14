@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import type {
   ToolConfigFieldRecord,
   ToolConfigRecord,
@@ -17,6 +17,7 @@ import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
+import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import {
   AGENT_COLLABORATION_CONFIG_KEYS,
@@ -416,6 +417,14 @@ function updateScalarField(tool: ToolDefinitionRecord, field: ToolConfigFieldRec
   store.setPolicyForScope(props.scopeKind, props.scopeId, localAllowedTools(), localPolicyName(), nextConfigs, cloneSourceConfigs());
 }
 
+const restoreResultTool = ref<ToolDefinitionRecord>();
+watch(() => [props.scopeKind, props.scopeId], () => { restoreResultTool.value = undefined; }, { flush: 'sync' });
+function confirmRestoreResult(): void {
+  const tool = restoreResultTool.value;
+  restoreResultTool.value = undefined;
+  if (tool) updateGateSetting(tool, 'autoSubmitResult', true);
+}
+
 type ToolGateSettingKey = 'autoApproveExecution' | 'autoApplyChange' | 'autoSubmitResult';
 
 function updateGateSetting(tool: ToolDefinitionRecord, key: ToolGateSettingKey, value: boolean): void {
@@ -716,6 +725,7 @@ function inputNumber(event: Event): number {
                     <span class="tool-pill">{{ executionLabel(tool) }}</span>
                     <span class="tool-pill">{{ riskLabel(tool) }}</span>
                     <span v-if="isSwitchGranted(tool)" class="tool-pill">跨对话协作开关</span>
+                    <span v-if="!toolGateValue(tool, 'autoSubmitResult')" class="tool-pill">结果回传已关闭 · 执行被阻止</span>
                   </span>
                 </span>
                 <span class="tool-config-toggle">
@@ -788,18 +798,13 @@ function inputNumber(event: Event): number {
                             <span class="permission-desc">工具生成可预览的修改提案时，自动触发聊天卡片里的“查看差异”。</span>
                           </span>
                         </LcCheckbox>
-                        <LcCheckbox
-                          class="tool-permission-card"
-                          :class="{ 'is-enabled': toolGateValue(tool, 'autoSubmitResult') }"
-                          :model-value="toolGateValue(tool, 'autoSubmitResult')"
-                          :disabled="editsBlocked"
-                          @update:model-value="updateGateSetting(tool, 'autoSubmitResult', $event)"
-                        >
+                        <div v-if="!toolGateValue(tool, 'autoSubmitResult')" class="tool-permission-card">
                           <span class="permission-copy">
-                            <span class="permission-title">自动回传结果</span>
-                            <span class="permission-desc">开启时工具结果自动发送给 LLM；关闭时先询问是否发送。</span>
+                            <span class="permission-title">此工具当前被阻止执行</span>
+                            <span class="permission-desc">已有配置关闭了结果回传；当前不支持回传前询问，因此工具不会执行。</span>
+                            <button type="button" :disabled="editsBlocked" @click="restoreResultTool = tool">恢复自动回传…</button>
                           </span>
-                        </LcCheckbox>
+                        </div>
                         <LcCheckbox
                           class="tool-permission-card"
                           :class="{ 'is-enabled': nativeAsyncValue(tool) }"
@@ -911,6 +916,14 @@ function inputNumber(event: Event): number {
       </div>
       <AdvancedScrollbar :scroller="scroller" variant="minimal" />
     </div>
+    <ConfirmPanel
+      :open="!!restoreResultTool"
+      title="恢复这个工具的自动回传？"
+      :description="`将在当前范围为 ${restoreResultTool?.name ?? ''} 开启自动回传。执行后的结果会发送给模型；其它工具、执行审批和权限限制不变。`"
+      confirm-label="确认恢复自动回传"
+      @confirm="confirmRestoreResult"
+      @cancel="restoreResultTool = undefined"
+    />
   </section>
 </template>
 

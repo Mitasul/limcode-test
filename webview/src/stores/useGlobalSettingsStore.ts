@@ -1311,22 +1311,18 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       return state.llmProviderConfigs.configs.find((config) => config.id === state.llm.activeProviderConfigId)
         ?? state.llmProviderConfigs.configs[0];
     },
-    activeCompressionConfig(state): LlmCompressionConfigRecord | undefined {
-      const activeProviderId = state.llm.activeProviderConfigId;
-      const binding = activeProviderId ? state.llmCompression.providerBindings.find((item) => item.providerConfigId === activeProviderId) : undefined;
-      const id = binding?.compressionConfigId ?? state.llmCompression.defaultConfigId;
-      return state.llmCompressionConfigs.configs.find((config) => config.id === id) ?? state.llmCompressionConfigs.configs[0];
+    activeCompressionConfig(): LlmCompressionConfigRecord | undefined {
+      return this.compressionConfigForProvider(this.llm.activeProviderConfigId);
     },
-    compressionConfigForActiveModel(state): (modelId: string) => LlmCompressionConfigRecord | undefined {
-      return (modelId: string) => {
-        const providerConfigId = state.llm.activeProviderConfigId || state.llmProviderConfigs.configs[0]?.id || '';
-        const model = modelId.trim();
-        const modelBinding = providerConfigId && model
-          ? state.llmCompression.modelBindings.find((item) => item.providerConfigId === providerConfigId && item.modelId === model)
-          : undefined;
-        const providerBinding = providerConfigId ? state.llmCompression.providerBindings.find((item) => item.providerConfigId === providerConfigId) : undefined;
+    compressionConfigForActiveModel(): (modelId: string) => LlmCompressionConfigRecord | undefined {
+      return (modelId) => this.compressionConfigForProvider(this.activeLlmProviderConfig?.id ?? '', modelId);
+    },
+    compressionConfigForProvider(state): (providerConfigId: string, modelId?: string) => LlmCompressionConfigRecord | undefined {
+      return (providerConfigId, modelId) => {
+        const modelBinding = modelId ? state.llmCompression.modelBindings.find(item => item.providerConfigId === providerConfigId && item.modelId === modelId.trim()) : undefined;
+        const providerBinding = state.llmCompression.providerBindings.find(item => item.providerConfigId === providerConfigId);
         const id = modelBinding?.compressionConfigId ?? providerBinding?.compressionConfigId ?? state.llmCompression.defaultConfigId;
-        return state.llmCompressionConfigs.configs.find((config) => config.id === id) ?? state.llmCompressionConfigs.configs[0];
+        return state.llmCompressionConfigs.configs.find(config => config.id === id) ?? state.llmCompressionConfigs.configs[0];
       };
     }
   },
@@ -1703,9 +1699,10 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
         this.status = `设置保存失败：${message}`;
       }
     },
-    selectCompressionConfigForActiveProvider(configId: string, deferPersist = false): void {
+    selectCompressionConfigForActiveProvider(configId: string, deferPersist = false, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
       if (!this.llmCompressionConfigs.configs.some((config) => config.id === configId)) return;
-      const providerConfigId = this.llm.activeProviderConfigId || this.activeLlmProviderConfig?.id || '';
+      const providerConfigId = targetProviderConfigId;
       if (!providerConfigId) {
         if (this.llmCompression.defaultConfigId === configId) return;
         this.llmCompression.defaultConfigId = configId;
@@ -1727,9 +1724,10 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       }
       this.saveLlmCompression();
     },
-    selectCompressionConfigForActiveModel(modelId: string, configId: string, deferPersist = false): void {
+    selectCompressionConfigForActiveModel(modelId: string, configId: string, deferPersist = false, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
       if (!this.llmCompressionConfigs.configs.some((config) => config.id === configId)) return;
-      const providerConfigId = this.llm.activeProviderConfigId || this.activeLlmProviderConfig?.id || '';
+      const providerConfigId = targetProviderConfigId;
       const model = modelId.trim();
       if (!providerConfigId || !model) return;
       const now = Date.now();
@@ -1782,10 +1780,11 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
         && modelRefs[0].providerConfigId === providerConfigId
         && modelRefs[0].modelId === model;
     },
-    /** 所有压缩编辑动作的统一入口：确保当前活动渠道拥有一份可独占编辑的压缩配置，共享时写时复制。 */
-    ensureCompressionConfigForActiveProvider(): LlmCompressionConfigRecord | undefined {
-      const providerConfigId = this.llm.activeProviderConfigId || this.activeLlmProviderConfig?.id || '';
-      const current = this.activeCompressionConfig;
+    /** 编辑可显式传入目标渠道；不传时沿用调用方的当前使用渠道。共享压缩配置仍写时复制。 */
+    ensureCompressionConfigForActiveProvider(targetProviderConfigId?: string): LlmCompressionConfigRecord | undefined {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const providerConfigId = targetProviderConfigId;
+      const current = this.compressionConfigForProvider(targetProviderConfigId);
 
       // A｜无活动渠道：保持原有“编辑默认配置”行为。新建默认配置时同样延迟持久化 defaultConfigId。
       if (!providerConfigId) {
@@ -1798,14 +1797,16 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
         return created;
       }
 
-      const providerName = this.llmProviderConfigs.configs.find((config) => config.id === providerConfigId)?.name?.trim();
+      const provider = this.llmProviderConfigs.configs.find((config) => config.id === providerConfigId);
+      if (!provider) return undefined;
+      const providerName = provider.name.trim();
 
       // B｜有活动渠道但解析不到配置：为该渠道新建独立配置，不动 defaultConfigId。
       if (!current) {
         const created = createDefaultLlmCompressionConfig(providerName ? `${providerName} 压缩` : '压缩方法');
         this.llmCompressionConfigs.configs.push(created);
         this.saveLlmCompressionConfigs();
-        this.selectCompressionConfigForActiveProvider(created.id, true);
+        this.selectCompressionConfigForActiveProvider(created.id, true, targetProviderConfigId);
         return created;
       }
 
@@ -1816,12 +1817,13 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       const clone = cloneCompressionConfigFrom(current, providerName ? `${providerName} 压缩` : current.name);
       this.llmCompressionConfigs.configs.push(clone);
       this.saveLlmCompressionConfigs();
-      this.selectCompressionConfigForActiveProvider(clone.id, true);
+      this.selectCompressionConfigForActiveProvider(clone.id, true, targetProviderConfigId);
       return clone;
     },
     /** 确保当前活动渠道下的某个模型拥有独立压缩配置；模型专属压缩配置也整体替代渠道默认压缩配置。 */
-    ensureCompressionConfigForActiveModel(modelId: string): LlmCompressionConfigRecord | undefined {
-      const providerConfigId = this.llm.activeProviderConfigId || this.activeLlmProviderConfig?.id || '';
+    ensureCompressionConfigForActiveModel(modelId: string, targetProviderConfigId?: string): LlmCompressionConfigRecord | undefined {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const providerConfigId = targetProviderConfigId;
       const model = modelId.trim();
       if (!providerConfigId || !model) return undefined;
       const provider = this.llmProviderConfigs.configs.find((config) => config.id === providerConfigId);
@@ -1832,11 +1834,11 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       const current = binding ? this.llmCompressionConfigs.configs.find((config) => config.id === binding.compressionConfigId) : undefined;
       if (current && this.isCompressionConfigOwnedByActiveModel(providerConfigId, model, current.id)) return current;
 
-      const source = current ?? this.activeCompressionConfig ?? createDefaultLlmCompressionConfig('默认压缩方法');
+      const source = current ?? this.compressionConfigForProvider(targetProviderConfigId) ?? createDefaultLlmCompressionConfig('默认压缩方法');
       const clone = cloneCompressionConfigFrom(source, `${provider.name} · ${modelRecord.name || model} 压缩`);
       this.llmCompressionConfigs.configs.push(clone);
       this.saveLlmCompressionConfigs();
-      this.selectCompressionConfigForActiveModel(model, clone.id, true);
+      this.selectCompressionConfigForActiveModel(model, clone.id, true, targetProviderConfigId);
       return clone;
     },
     updateCompressionConfig(configId: string, patch: Partial<LlmCompressionConfigRecord>): void {
@@ -1845,63 +1847,70 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       Object.assign(config, patch, { updatedAt: Date.now() });
       this.queueLlmCompressionConfigsAutoSave();
     },
-    updateActiveCompressionTrigger(patch: Partial<LlmCompressionConfigRecord['trigger']>): void {
-      const config = this.ensureCompressionConfigForActiveProvider();
+    updateActiveCompressionTrigger(patch: Partial<LlmCompressionConfigRecord['trigger']>, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveProvider(targetProviderConfigId);
       if (!config) return;
       const nextTrigger = normalizeCompressionTriggerForUi(
         { ...config.trigger, ...patch },
-        this.activeLlmProviderConfig?.contextWindowTokens
+        this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId)?.contextWindowTokens
       );
       if (sameSerializableValue(config.trigger, nextTrigger)) {
-        this.selectCompressionConfigForActiveProvider(config.id);
+        this.selectCompressionConfigForActiveProvider(config.id, false, targetProviderConfigId);
         return;
       }
       config.trigger = nextTrigger;
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveProvider(config.id);
+      this.selectCompressionConfigForActiveProvider(config.id, false, targetProviderConfigId);
     },
-    setActiveCompressionMaxDurationMinutes(value: number): void {
-      const config = this.ensureCompressionConfigForActiveProvider();
+    setActiveCompressionMaxDurationMinutes(value: number, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveProvider(targetProviderConfigId);
       if (!config) return;
       this.updateCompressionConfig(config.id, { maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(value) });
-      this.selectCompressionConfigForActiveProvider(config.id);
+      this.selectCompressionConfigForActiveProvider(config.id, false, targetProviderConfigId);
     },
-    setActiveCompressionBodyTargetTokens(value: number): void {
-      const config = this.ensureCompressionConfigForActiveProvider();
+    setActiveCompressionBodyTargetTokens(value: number, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveProvider(targetProviderConfigId);
       if (!config) return;
       this.updateCompressionConfig(config.id, { bodyTargetTokens: normalizeLlmCompressionBodyTargetTokens(value) });
-      this.selectCompressionConfigForActiveProvider(config.id);
+      this.selectCompressionConfigForActiveProvider(config.id, false, targetProviderConfigId);
     },
-    setActiveCompressionMethodKind(kind: SelectableCompressionMethodKind): void {
-      const config = this.ensureCompressionConfigForActiveProvider();
+    setActiveCompressionMethodKind(kind: SelectableCompressionMethodKind, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveProvider(targetProviderConfigId);
       if (!config) return;
       ensureCompressionStrategyDefaults(config);
       config.kind = kind;
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveProvider(config.id);
+      this.selectCompressionConfigForActiveProvider(config.id, false, targetProviderConfigId);
     },
-    setActiveCompressionNativeTrustMode(value: LlmNativeCompactionTrustMode): void {
-      const config = this.ensureCompressionConfigForActiveProvider();
+    setActiveCompressionNativeTrustMode(value: LlmNativeCompactionTrustMode, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveProvider(targetProviderConfigId);
       if (!config) return;
       ensureCompressionStrategyDefaults(config);
       config.providerNative!.trustMode = normalizeNativeCompactionTrustMode(value);
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveProvider(config.id);
+      this.selectCompressionConfigForActiveProvider(config.id, false, targetProviderConfigId);
     },
-    setActiveCompressionSummaryReasoningMode(value: LlmSummaryReasoningMode): void {
-      const config = this.ensureCompressionConfigForActiveProvider();
+    setActiveCompressionSummaryReasoningMode(value: LlmSummaryReasoningMode, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveProvider(targetProviderConfigId);
       if (!config) return;
       ensureCompressionStrategyDefaults(config);
       config.llmSummary!.reasoning = { mode: normalizeSummaryReasoningModeForUi(value) };
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveProvider(config.id);
+      this.selectCompressionConfigForActiveProvider(config.id, false, targetProviderConfigId);
     },
-    setActiveCompressionSummaryGenerationConfig(value: LlmGenerationConfigRecord | undefined): void {
-      const config = this.ensureCompressionConfigForActiveProvider();
+    setActiveCompressionSummaryGenerationConfig(value: LlmGenerationConfigRecord | undefined, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveProvider(targetProviderConfigId);
       if (!config) return;
       ensureCompressionStrategyDefaults(config);
       const cleaned = sanitizeGenerationConfig(value);
@@ -1909,19 +1918,21 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       else delete config.llmSummary!.generationConfig;
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveProvider(config.id);
+      this.selectCompressionConfigForActiveProvider(config.id, false, targetProviderConfigId);
     },
-    setActiveCompressionFallbacks(values: LlmCompressionFallbackKind[]): void {
-      const config = this.ensureCompressionConfigForActiveProvider();
+    setActiveCompressionFallbacks(values: LlmCompressionFallbackKind[], targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveProvider(targetProviderConfigId);
       if (!config) return;
       ensureCompressionStrategyDefaults(config);
       config.fallbacks = normalizeCompressionFallbacks(values);
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveProvider(config.id);
+      this.selectCompressionConfigForActiveProvider(config.id, false, targetProviderConfigId);
     },
-    setActiveCompressionProviderConfig(providerConfigId: string): void {
-      const config = this.ensureCompressionConfigForActiveProvider();
+    setActiveCompressionProviderConfig(providerConfigId: string, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveProvider(targetProviderConfigId);
       if (!config) return;
       const id = providerConfigId.trim();
       const applyProvider = <T extends { providerConfigId?: string }>(target: T): T => {
@@ -1933,52 +1944,57 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       config.llmSummary = applyProvider({ ...(config.llmSummary ?? createDefaultLlmCompressionConfig('临时').llmSummary ?? {}) });
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveProvider(config.id);
+      this.selectCompressionConfigForActiveProvider(config.id, false, targetProviderConfigId);
     },
-    updateModelCompressionTrigger(modelId: string, patch: Partial<LlmCompressionConfigRecord['trigger']>): void {
-      const config = this.ensureCompressionConfigForActiveModel(modelId);
+    updateModelCompressionTrigger(modelId: string, patch: Partial<LlmCompressionConfigRecord['trigger']>, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveModel(modelId, targetProviderConfigId);
       if (!config) return;
-      const modelConfig = this.activeLlmProviderConfig?.modelConfigs.find((item) => item.modelId === modelId.trim());
-      const contextWindowTokens = modelConfig?.contextWindowTokens ?? this.activeLlmProviderConfig?.contextWindowTokens;
+      const modelConfig = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId)?.modelConfigs.find((item) => item.modelId === modelId.trim());
+      const contextWindowTokens = modelConfig?.contextWindowTokens ?? this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId)?.contextWindowTokens;
       const nextTrigger = normalizeCompressionTriggerForUi({ ...config.trigger, ...patch }, contextWindowTokens);
       if (sameSerializableValue(config.trigger, nextTrigger)) {
-        this.selectCompressionConfigForActiveModel(modelId, config.id);
+        this.selectCompressionConfigForActiveModel(modelId, config.id, false, targetProviderConfigId);
         return;
       }
       config.trigger = nextTrigger;
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveModel(modelId, config.id);
+      this.selectCompressionConfigForActiveModel(modelId, config.id, false, targetProviderConfigId);
     },
-    setModelCompressionMethodKind(modelId: string, kind: SelectableCompressionMethodKind): void {
-      const config = this.ensureCompressionConfigForActiveModel(modelId);
+    setModelCompressionMethodKind(modelId: string, kind: SelectableCompressionMethodKind, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveModel(modelId, targetProviderConfigId);
       if (!config) return;
       ensureCompressionStrategyDefaults(config);
       config.kind = kind;
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveModel(modelId, config.id);
+      this.selectCompressionConfigForActiveModel(modelId, config.id, false, targetProviderConfigId);
     },
-    setModelCompressionNativeTrustMode(modelId: string, value: LlmNativeCompactionTrustMode): void {
-      const config = this.ensureCompressionConfigForActiveModel(modelId);
+    setModelCompressionNativeTrustMode(modelId: string, value: LlmNativeCompactionTrustMode, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveModel(modelId, targetProviderConfigId);
       if (!config) return;
       ensureCompressionStrategyDefaults(config);
       config.providerNative!.trustMode = normalizeNativeCompactionTrustMode(value);
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveModel(modelId, config.id);
+      this.selectCompressionConfigForActiveModel(modelId, config.id, false, targetProviderConfigId);
     },
-    setModelCompressionSummaryReasoningMode(modelId: string, value: LlmSummaryReasoningMode): void {
-      const config = this.ensureCompressionConfigForActiveModel(modelId);
+    setModelCompressionSummaryReasoningMode(modelId: string, value: LlmSummaryReasoningMode, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveModel(modelId, targetProviderConfigId);
       if (!config) return;
       ensureCompressionStrategyDefaults(config);
       config.llmSummary!.reasoning = { mode: normalizeSummaryReasoningModeForUi(value) };
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveModel(modelId, config.id);
+      this.selectCompressionConfigForActiveModel(modelId, config.id, false, targetProviderConfigId);
     },
-    setModelCompressionSummaryGenerationConfig(modelId: string, value: LlmGenerationConfigRecord | undefined): void {
-      const config = this.ensureCompressionConfigForActiveModel(modelId);
+    setModelCompressionSummaryGenerationConfig(modelId: string, value: LlmGenerationConfigRecord | undefined, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveModel(modelId, targetProviderConfigId);
       if (!config) return;
       ensureCompressionStrategyDefaults(config);
       const cleaned = sanitizeGenerationConfig(value);
@@ -1986,31 +2002,35 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       else delete config.llmSummary!.generationConfig;
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveModel(modelId, config.id);
+      this.selectCompressionConfigForActiveModel(modelId, config.id, false, targetProviderConfigId);
     },
-    setModelCompressionFallbacks(modelId: string, values: LlmCompressionFallbackKind[]): void {
-      const config = this.ensureCompressionConfigForActiveModel(modelId);
+    setModelCompressionFallbacks(modelId: string, values: LlmCompressionFallbackKind[], targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveModel(modelId, targetProviderConfigId);
       if (!config) return;
       ensureCompressionStrategyDefaults(config);
       config.fallbacks = normalizeCompressionFallbacks(values);
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveModel(modelId, config.id);
+      this.selectCompressionConfigForActiveModel(modelId, config.id, false, targetProviderConfigId);
     },
-    setModelCompressionMaxDurationMinutes(modelId: string, value: number): void {
-      const config = this.ensureCompressionConfigForActiveModel(modelId);
+    setModelCompressionMaxDurationMinutes(modelId: string, value: number, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveModel(modelId, targetProviderConfigId);
       if (!config) return;
       this.updateCompressionConfig(config.id, { maxDurationMinutes: normalizeLlmCompressionMaxDurationMinutes(value) });
-      this.selectCompressionConfigForActiveModel(modelId, config.id);
+      this.selectCompressionConfigForActiveModel(modelId, config.id, false, targetProviderConfigId);
     },
-    setModelCompressionBodyTargetTokens(modelId: string, value: number): void {
-      const config = this.ensureCompressionConfigForActiveModel(modelId);
+    setModelCompressionBodyTargetTokens(modelId: string, value: number, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveModel(modelId, targetProviderConfigId);
       if (!config) return;
       this.updateCompressionConfig(config.id, { bodyTargetTokens: normalizeLlmCompressionBodyTargetTokens(value) });
-      this.selectCompressionConfigForActiveModel(modelId, config.id);
+      this.selectCompressionConfigForActiveModel(modelId, config.id, false, targetProviderConfigId);
     },
-    setModelCompressionProviderConfig(modelId: string, providerConfigId: string): void {
-      const config = this.ensureCompressionConfigForActiveModel(modelId);
+    setModelCompressionProviderConfig(modelId: string, providerConfigId: string, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.ensureCompressionConfigForActiveModel(modelId, targetProviderConfigId);
       if (!config) return;
       const id = providerConfigId.trim();
       const applyProvider = <T extends { providerConfigId?: string }>(target: T): T => {
@@ -2022,7 +2042,7 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       config.llmSummary = applyProvider({ ...(config.llmSummary ?? createDefaultLlmCompressionConfig('临时').llmSummary ?? {}) });
       config.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveModel(modelId, config.id);
+      this.selectCompressionConfigForActiveModel(modelId, config.id, false, targetProviderConfigId);
     },
 
 
@@ -2030,15 +2050,21 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
     selectLlmProviderConfig(configId: string): void {
       if (!this.llmProviderConfigs.configs.some((config) => config.id === configId)) return;
       this.llm.activeProviderConfigId = configId;
-      this.saveLlm();
+      // A newly created channel must be committed before persisting its explicit selection.
+      const committed = this.baselines.llmProviderConfigs as LlmProviderConfigsRecord | undefined;
+      if (!committed?.configs.some(config => config.id === configId)) {
+        this.pendingActiveProviderConfigIdAfterConfigsSave = configId;
+      } else {
+        this.pendingActiveProviderConfigIdAfterConfigsSave = '';
+        this.saveLlm();
+      }
     },
-    createLlmProviderConfig(name = '新渠道配置', provider: LlmProviderKind = 'openai-compatible', baseUrl?: string): void {
+    createLlmProviderConfig(name = '新渠道配置', provider: LlmProviderKind = 'openai-compatible', baseUrl?: string): string {
       const config = createDefaultProviderConfig(name.trim() || '新渠道配置', provider);
       if (baseUrl?.trim()) config.baseUrl = baseUrl.trim();
       this.llmProviderConfigs.configs.push(config);
-      this.llm.activeProviderConfigId = config.id;
-      this.pendingActiveProviderConfigIdAfterConfigsSave = config.id;
       this.saveLlmProviderConfigs();
+      return config.id;
     },
     renameLlmProviderConfig(configId: string, name: string): void {
       const config = this.llmProviderConfigs.configs.find((candidate) => candidate.id === configId);
@@ -2047,14 +2073,16 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       config.updatedAt = Date.now();
       this.saveLlmProviderConfigs();
     },
-    updateActiveLlmProviderConfig(patch: Partial<LlmProviderConfigRecord>): void {
-      const config = this.activeLlmProviderConfig;
+    updateActiveLlmProviderConfig(patch: Partial<LlmProviderConfigRecord>, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       Object.assign(config, patch, { updatedAt: Date.now() });
       this.queueLlmProviderConfigsAutoSave();
     },
-    updateActiveLlmContextWindowTokens(value: number | undefined): void {
-      const config = this.activeLlmProviderConfig;
+    updateActiveLlmContextWindowTokens(value: number | undefined, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       const previousWindowTokens = normalizeTokenCount(config.contextWindowTokens);
       const nextWindowTokens = normalizeTokenCount(value);
@@ -2065,7 +2093,7 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
 
       // 清空窗口不应触发写时复制，故在 ensure 之前早退。
       if (nextWindowTokens === undefined) return;
-      const compressionConfig = this.ensureCompressionConfigForActiveProvider();
+      const compressionConfig = this.ensureCompressionConfigForActiveProvider(targetProviderConfigId);
       if (!compressionConfig) return;
       compressionConfig.trigger = thresholdAfterContextWindowChange(
         compressionConfig.trigger,
@@ -2074,31 +2102,35 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       );
       compressionConfig.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveProvider(compressionConfig.id);
+      this.selectCompressionConfigForActiveProvider(compressionConfig.id, false, targetProviderConfigId);
     },
-    updateActiveLlmGenerationConfig(generationConfig: LlmGenerationConfigRecord | undefined): void {
-      const config = this.activeLlmProviderConfig;
+    updateActiveLlmGenerationConfig(generationConfig: LlmGenerationConfigRecord | undefined, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       config.generationConfig = normalizeGenerationConfigForUi(generationConfig) ?? {};
       config.updatedAt = Date.now();
       this.queueLlmProviderConfigsAutoSave();
     },
-    updateActiveLlmRequestBody(requestBody: LlmRequestBodyRecord | undefined): void {
-      const config = this.activeLlmProviderConfig;
+    updateActiveLlmRequestBody(requestBody: LlmRequestBodyRecord | undefined, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       config.requestBody = sanitizeRequestBody(requestBody) ?? {};
       config.updatedAt = Date.now();
       this.queueLlmProviderConfigsAutoSave();
     },
-    updateActiveLlmPromptCache(promptCache: LlmPromptCacheConfigRecord | undefined): void {
-      const config = this.activeLlmProviderConfig;
+    updateActiveLlmPromptCache(promptCache: LlmPromptCacheConfigRecord | undefined, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       config.promptCache = sanitizePromptCache(promptCache, config.provider);
       config.updatedAt = Date.now();
       this.queueLlmProviderConfigsAutoSave();
     },
-    updateActiveLlmNativeResponses(nativeResponses: OpenAIResponsesNativeSettings | undefined): void {
-      const config = this.activeLlmProviderConfig;
+    updateActiveLlmNativeResponses(nativeResponses: OpenAIResponsesNativeSettings | undefined, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       const normalized = normalizeOpenAIResponsesNativeSettings(nativeResponses);
       if (normalized) config.nativeResponses = normalized;
@@ -2106,15 +2138,17 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       config.updatedAt = Date.now();
       this.queueLlmProviderConfigsAutoSave();
     },
-    updateActiveLlmHeaders(headers: LlmProviderHeadersRecord | undefined): void {
-      const config = this.activeLlmProviderConfig;
+    updateActiveLlmHeaders(headers: LlmProviderHeadersRecord | undefined, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       config.headers = sanitizeHeaders(headers) ?? {};
       config.updatedAt = Date.now();
       this.queueLlmProviderConfigsAutoSave();
     },
-    createModelConfigForActiveConfig(modelId: string): LlmProviderModelConfigRecord | undefined {
-      const config = this.activeLlmProviderConfig;
+    createModelConfigForActiveConfig(modelId: string, targetProviderConfigId?: string): LlmProviderModelConfigRecord | undefined {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       const id = modelId.trim();
       if (!config || !id || !config.models.some((model) => model.id === id)) return undefined;
       const existing = config.modelConfigs.find((candidate) => candidate.modelId === id);
@@ -2123,11 +2157,12 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       config.modelConfigs = sanitizeModelConfigs([...(config.modelConfigs ?? []), created], config.models, config.provider);
       config.updatedAt = Date.now();
       this.saveLlmProviderConfigs();
-      this.ensureCompressionConfigForActiveModel(id);
+      this.ensureCompressionConfigForActiveModel(id, targetProviderConfigId);
       return created;
     },
-    updateActiveModelConfig(modelConfigId: string, patch: Partial<LlmProviderModelConfigRecord>): void {
-      const config = this.activeLlmProviderConfig;
+    updateActiveModelConfig(modelConfigId: string, patch: Partial<LlmProviderModelConfigRecord>, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       const modelConfig = config.modelConfigs.find((candidate) => candidate.id === modelConfigId);
       if (!modelConfig) return;
@@ -2136,8 +2171,9 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       config.updatedAt = Date.now();
       this.queueLlmProviderConfigsAutoSave();
     },
-    updateActiveModelConfigContextWindowTokens(modelConfigId: string, value: number | undefined): void {
-      const config = this.activeLlmProviderConfig;
+    updateActiveModelConfigContextWindowTokens(modelConfigId: string, value: number | undefined, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       const modelConfig = config.modelConfigs.find((candidate) => candidate.id === modelConfigId);
       if (!modelConfig) return;
@@ -2150,7 +2186,7 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       this.queueLlmProviderConfigsAutoSave();
 
       if (nextWindowTokens === undefined) return;
-      const compressionConfig = this.ensureCompressionConfigForActiveModel(modelConfig.modelId);
+      const compressionConfig = this.ensureCompressionConfigForActiveModel(modelConfig.modelId, targetProviderConfigId);
       if (!compressionConfig) return;
       compressionConfig.trigger = thresholdAfterContextWindowChange(
         compressionConfig.trigger,
@@ -2159,10 +2195,11 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       );
       compressionConfig.updatedAt = Date.now();
       this.queueLlmCompressionConfigsAutoSave();
-      this.selectCompressionConfigForActiveModel(modelConfig.modelId, compressionConfig.id);
+      this.selectCompressionConfigForActiveModel(modelConfig.modelId, compressionConfig.id, false, targetProviderConfigId);
     },
-    updateActiveModelConfigGenerationConfig(modelConfigId: string, generationConfig: LlmGenerationConfigRecord | undefined): void {
-      const config = this.activeLlmProviderConfig;
+    updateActiveModelConfigGenerationConfig(modelConfigId: string, generationConfig: LlmGenerationConfigRecord | undefined, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       const modelConfig = config.modelConfigs.find((candidate) => candidate.id === modelConfigId);
       if (!modelConfig) return;
@@ -2171,8 +2208,9 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       config.updatedAt = Date.now();
       this.queueLlmProviderConfigsAutoSave();
     },
-    updateActiveModelConfigRequestBody(modelConfigId: string, requestBody: LlmRequestBodyRecord | undefined): void {
-      const config = this.activeLlmProviderConfig;
+    updateActiveModelConfigRequestBody(modelConfigId: string, requestBody: LlmRequestBodyRecord | undefined, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       const modelConfig = config.modelConfigs.find((candidate) => candidate.id === modelConfigId);
       if (!modelConfig) return;
@@ -2181,8 +2219,9 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       config.updatedAt = Date.now();
       this.queueLlmProviderConfigsAutoSave();
     },
-    updateActiveModelConfigPromptCache(modelConfigId: string, promptCache: LlmPromptCacheConfigRecord | undefined): void {
-      const config = this.activeLlmProviderConfig;
+    updateActiveModelConfigPromptCache(modelConfigId: string, promptCache: LlmPromptCacheConfigRecord | undefined, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       const modelConfig = config.modelConfigs.find((candidate) => candidate.id === modelConfigId);
       if (!modelConfig) return;
@@ -2191,8 +2230,9 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       config.updatedAt = Date.now();
       this.queueLlmProviderConfigsAutoSave();
     },
-    updateActiveModelConfigNativeResponses(modelConfigId: string, nativeResponses: OpenAIResponsesNativeSettings | undefined): void {
-      const config = this.activeLlmProviderConfig;
+    updateActiveModelConfigNativeResponses(modelConfigId: string, nativeResponses: OpenAIResponsesNativeSettings | undefined, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       const modelConfig = config.modelConfigs.find((candidate) => candidate.id === modelConfigId);
       if (!modelConfig) return;
@@ -2203,8 +2243,9 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       config.updatedAt = Date.now();
       this.queueLlmProviderConfigsAutoSave();
     },
-    updateActiveModelConfigHeaders(modelConfigId: string, headers: LlmProviderHeadersRecord | undefined): void {
-      const config = this.activeLlmProviderConfig;
+    updateActiveModelConfigHeaders(modelConfigId: string, headers: LlmProviderHeadersRecord | undefined, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       const modelConfig = config.modelConfigs.find((candidate) => candidate.id === modelConfigId);
       if (!modelConfig) return;
@@ -2213,8 +2254,9 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       config.updatedAt = Date.now();
       this.queueLlmProviderConfigsAutoSave();
     },
-    deleteModelConfigFromActiveConfig(modelConfigId: string): void {
-      const config = this.activeLlmProviderConfig;
+    deleteModelConfigFromActiveConfig(modelConfigId: string, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       const removed = config.modelConfigs.find((candidate) => candidate.id === modelConfigId);
       const next = config.modelConfigs.filter((candidate) => candidate.id !== modelConfigId);
@@ -2224,8 +2266,9 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       config.updatedAt = Date.now();
       this.saveLlmProviderConfigs();
     },
-    requestModelsForActiveConfig(): void {
-      const config = this.activeLlmProviderConfig;
+    requestModelsForActiveConfig(targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       const requestConfig = toPlainProviderConfig(config);
       clearModelFetch(this);
@@ -2370,20 +2413,19 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
           return kept && (kept.source === 'verified_probe' || !model.capabilitySnapshot) ? { ...model, capabilitySnapshot: kept } : model;
         })
       ]);
-      if (!config.model) config.model = selected[0]?.id ?? '';
       config.updatedAt = Date.now();
       this.status = `已添加 ${selected.length} 个 LLM`;
       this.closeFetchedModelsDialog();
       this.saveLlmProviderConfigs();
     },
-    addModelToActiveConfig(modelId: string, modelName?: string): void {
-      const config = this.activeLlmProviderConfig;
+    addModelToActiveConfig(modelId: string, modelName?: string, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       const id = modelId.trim();
       if (!config || !id) return;
       const name = modelName?.trim() || id;
       const models = sanitizeModels([...config.models.filter((model) => model.id !== id), { id, name }]);
       config.models = models;
-      config.model = id;
       config.updatedAt = Date.now();
       this.saveLlmProviderConfigs();
     },
@@ -2400,8 +2442,9 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       config.updatedAt = Date.now();
       this.saveLlmProviderConfigs();
     },
-    removeModelFromActiveConfig(modelId: string): void {
-      const config = this.activeLlmProviderConfig;
+    removeModelFromActiveConfig(modelId: string, targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       config.models = config.models.filter((model) => model.id !== modelId);
       config.modelConfigs = config.modelConfigs.filter((modelConfig) => modelConfig.modelId !== modelId);
@@ -2410,8 +2453,9 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       config.updatedAt = Date.now();
       this.saveLlmProviderConfigs();
     },
-    clearModelsFromActiveConfig(): void {
-      const config = this.activeLlmProviderConfig;
+    clearModelsFromActiveConfig(targetProviderConfigId?: string): void {
+      targetProviderConfigId ??= this.activeLlmProviderConfig?.id ?? '';
+      const config = this.llmProviderConfigs.configs.find((item) => item.id === targetProviderConfigId);
       if (!config) return;
       for (const modelConfig of config.modelConfigs) {
         this.cleanupCompressionForDeletedModel(config.id, modelConfig.modelId);
@@ -2689,12 +2733,11 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
     flushDependentSettingsAfterCommittedSnapshot(payload: GlobalSettingsSnapshotPayload): void {
       if (payload.section === 'llmProviderConfigs' && this.pendingActiveProviderConfigIdAfterConfigsSave) {
         const pendingId = this.pendingActiveProviderConfigIdAfterConfigsSave;
-        this.pendingActiveProviderConfigIdAfterConfigsSave = '';
         const configs = (payload.settings as LlmProviderConfigsRecord).configs;
-        this.llm.activeProviderConfigId = configs.some((config) => config.id === pendingId)
-          ? pendingId
-          : configs[0]?.id ?? '';
-        this.saveLlm();
+        if (configs.some((config) => config.id === pendingId)) {
+          this.pendingActiveProviderConfigIdAfterConfigsSave = '';
+          this.saveLlm();
+        }
       }
       if (payload.section === 'llmCompressionConfigs' && this.flushCompressionBindingAfterConfigsSave) {
         this.flushCompressionBindingAfterConfigsSave = false;

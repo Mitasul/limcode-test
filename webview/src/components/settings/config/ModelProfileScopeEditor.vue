@@ -80,10 +80,6 @@ const selectedProviderConfigId = computed({
     providerConfigId.value = value || INHERIT_GLOBAL_MODEL_ID;
     if (providerConfigId.value === INHERIT_GLOBAL_MODEL_ID) {
       model.value = '';
-      if (local.value.profile) {
-        const requestId = store.clearProfileScope(props.scopeKind, props.scopeId);
-        if (requestId) draftState.markSubmitted(requestId);
-      }
       return;
     }
     const config = globalSettings.llmProviderConfigs.configs.find((item) => item.id === providerConfigId.value);
@@ -96,6 +92,7 @@ function save(): void {
   if (isInheritSelected.value) {
     const requestId = store.clearProfileScope(props.scopeKind, props.scopeId);
     if (requestId) draftState.markSubmitted(requestId);
+    else draftState.reset();
     return;
   }
   const config = activeConfig.value;
@@ -134,8 +131,8 @@ function save(): void {
     </template>
     <ModelProfileSaveStatus :scope-kind="scopeKind" :scope-id="scopeId" :discard-draft="discardDraft" />
     <div class="model-profile-actions">
-      <button v-if="!isInheritSelected" type="button" :disabled="!model.trim()" @click="save">保存 LLM 配置</button>
-      <span v-else>当前将继承全局/对话的 LLM 配置。</span>
+      <button type="button" :disabled="!isInheritSelected && !model.trim()" @click="save">保存 LLM 配置</button>
+      <span v-if="isInheritSelected">保存后继承全局/对话的 LLM 配置。</span>
       <span>{{ store.status }}</span>
     </div>
   </section>

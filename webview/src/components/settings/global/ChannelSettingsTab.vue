@@ -1,21 +1,7 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
-import { IconChevronDown, IconCloudDown, IconPencil, IconPlus, IconSearch, IconTrash } from '@tabler/icons-vue';
-import {
-  type LlmCompressionConfigRecord,
-  type LlmCompressionFallbackKind,
-  type LlmGenerationConfigRecord,
-  type LlmProviderConfigRecord,
-  type LlmProviderHeadersRecord,
-  type LlmProviderKind,
-  type LlmNativeCompactionTrustMode,
-  type LlmSummaryReasoningMode,
-  type LlmProviderModelConfigRecord,
-  type LlmProviderModelRecord,
-  type LlmPromptCacheConfigRecord,
-  type LlmRequestBodyRecord
-} from '@shared/protocol';
-import type { OpenAIResponsesNativeSettings } from '@shared/openAIResponsesNative';
+import { computed, ref, watch } from 'vue';
+import { IconCloudDown, IconPencil, IconPlus, IconSearch, IconTrash } from '@tabler/icons-vue';
+import type { LlmProviderConfigRecord, LlmProviderKind, LlmProviderModelConfigRecord, LlmProviderModelRecord } from '@shared/protocol';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
@@ -23,8 +9,7 @@ import InputPanel from '@webview/components/ui/InputPanel.vue';
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
-import LlmAdvancedConfigEditor from './LlmAdvancedConfigEditor.vue';
-import LlmCompressionSettingsEditor from './LlmCompressionSettingsEditor.vue';
+import ChannelConfigEditor from './ChannelConfigEditor.vue';
 import ModelFetchDialog from './ModelFetchDialog.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from './SettingsDropdown.vue';
 import { OPENAI_COMPATIBLE_SERVICE_PRESETS } from '@shared/openAICompatibleDialect';
@@ -39,7 +24,6 @@ const settings = useGlobalSettingsStore();
 const { loading: channelLoading, text: channelLoadingText } = useSettingsLoadingText('渠道配置', 'global', undefined, {
   globalSettingsSections: ['llm', 'llmProviderConfigs', 'llmCompression', 'llmCompressionConfigs'] as const
 });
-type SelectableCompressionMethodKind = 'auto' | 'provider_native' | 'llm_summary' | 'segmented_summary' | 'deterministic_summary';
 const createOpen = ref(false);
 const createProvider = ref<LlmProviderKind>('openai-compatible');
 const renameOpen = ref(false);
@@ -49,10 +33,9 @@ const newModelName = ref('');
 const modelFilter = ref('');
 const modelListScroller = ref<HTMLElement | null>(null);
 const clearModelsConfirmOpen = ref(false);
-const defaultConfigOpen = ref(true);
-const modelSpecificGroupOpen = ref(true);
-const modelSpecificPanelOpen = ref<Record<string, boolean>>({});
-const newModelSpecificModelId = ref('');
+const selectedEditorModelId = ref('');
+const selectedProviderConfigId = ref('');
+const dialogProviderConfigId = ref('');
 const deleteModelConfigConfirmOpen = ref(false);
 const deletingModelConfigId = ref('');
 /** “测试这个模型”确认框：两处入口（思考参数写法字段、LLM 列表每行）共用。 */
@@ -77,55 +60,46 @@ const createServiceOptions: SettingsDropdownOption[] = [
 ];
 const createService = ref('');
 
-type AdvancedConfigPatch = Partial<Pick<
-  LlmProviderConfigRecord,
-  'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryForceAllErrors' | 'retryMaxAttempts' | 'retryDelaySeconds' | 'enableMultimodalTools' | 'systemPromptPrefix'
-  | 'claudeTurnScopedReminders' | 'openaiCompatibleThinkingFormat'
->>;
-
-const activeConfig = computed(() => settings.activeLlmProviderConfig);
-const canDeleteActiveConfig = computed(() => !!activeConfig.value && settings.llmProviderConfigs.configs.length > 1);
-const activeConfigId = computed({
-  get: () => settings.llm.activeProviderConfigId || activeConfig.value?.id || '',
-  set: (configId: string) => settings.selectLlmProviderConfig(configId)
+watch(() => settings.llmProviderConfigs.configs.map(config => config.id), ids => {
+  if (ids.includes(selectedProviderConfigId.value)) return;
+  selectedProviderConfigId.value = ids.includes(settings.llm.activeProviderConfigId)
+    ? settings.llm.activeProviderConfigId : ids[0] ?? '';
+  selectedEditorModelId.value = '';
+}, { immediate: true, flush: 'sync' });
+const editingConfig = computed(() => settings.llmProviderConfigs.configs.find(config => config.id === selectedProviderConfigId.value));
+const dialogConfig = computed(() => settings.llmProviderConfigs.configs.find(config => config.id === dialogProviderConfigId.value));
+const selectedModelConfig = computed(() => editingModelConfigs.value.find(item => item.modelId === selectedEditorModelId.value));
+const editorTargetOptions = computed<SettingsDropdownOption[]>(() => [
+  { value: '', label: '渠道默认配置' },
+  ...(editingConfig.value?.models ?? []).map(model => ({ value: model.id, label: model.name,
+    description: editingModelConfigs.value.some(item => item.modelId === model.id) ? '独立完整副本' : '使用渠道默认配置' }))
+]);
+const editorModelId = computed({
+  get: () => editingConfig.value?.models.some(model => model.id === selectedEditorModelId.value) ? selectedEditorModelId.value : '',
+  set: (value: string) => { selectedEditorModelId.value = value; }
+});
+const canDeleteConfig = computed(() => !!editingConfig.value && settings.llmProviderConfigs.configs.length > 1);
+const editingConfigId = computed({
+  get: () => editingConfig.value?.id ?? '',
+  set: (configId: string) => { selectedProviderConfigId.value = configId; selectedEditorModelId.value = ''; }
 });
 const configPageOptions = computed<SettingsDropdownOption[]>(() =>
   settings.llmProviderConfigs.configs.map((config) => ({ value: config.id, label: config.name, description: providerLabel(config.provider) }))
 );
-const activeProviderLabel = computed(() => providerLabel(activeConfig.value?.provider));
+const editingProviderLabel = computed(() => providerLabel(editingConfig.value?.provider));
 const filteredModels = computed<LlmProviderModelRecord[]>(() => {
   const keyword = modelFilter.value.trim().toLowerCase();
-  const models = activeConfig.value?.models ?? [];
+  const models = editingConfig.value?.models ?? [];
   if (!keyword) return models;
   return models.filter((model) => {
     return model.id.toLowerCase().includes(keyword) || model.name.toLowerCase().includes(keyword);
   });
 });
-const contextWindowTokens = computed(() => normalizeTokenCount(activeConfig.value?.contextWindowTokens) ?? 0);
 
-const hasModels = computed(() => (activeConfig.value?.models.length ?? 0) > 0);
-const canClearModels = computed(() => !!activeConfig.value && hasModels.value);
-const activeModelConfigs = computed<LlmProviderModelConfigRecord[]>(() => activeConfig.value?.modelConfigs ?? []);
-const modelSpecificOptions = computed<SettingsDropdownOption[]>(() => {
-  const config = activeConfig.value;
-  if (!config) return [];
-  const configured = new Set(config.modelConfigs.map((item) => item.modelId));
-  return config.models
-    .filter((model) => !configured.has(model.id))
-    .map((model) => ({ value: model.id, label: model.name, description: model.id }));
-});
-const selectedNewModelSpecificModelId = computed({
-  get: () => {
-    const options = modelSpecificOptions.value;
-    if (options.some((option) => option.value === newModelSpecificModelId.value)) return newModelSpecificModelId.value;
-    return options[0]?.value ?? '';
-  },
-  set: (modelId: string) => {
-    newModelSpecificModelId.value = modelId;
-  }
-});
-const canCreateModelSpecificConfig = computed(() => !!activeConfig.value && !!selectedNewModelSpecificModelId.value);
-const deletingModelConfig = computed(() => activeModelConfigs.value.find((config) => config.id === deletingModelConfigId.value));
+const hasModels = computed(() => (editingConfig.value?.models.length ?? 0) > 0);
+const canClearModels = computed(() => !!editingConfig.value && hasModels.value);
+const editingModelConfigs = computed<LlmProviderModelConfigRecord[]>(() => editingConfig.value?.modelConfigs ?? []);
+const deletingModelConfig = computed(() => dialogConfig.value?.modelConfigs.find((config) => config.id === deletingModelConfigId.value));
 const deletingModelConfigLabel = computed(() => deletingModelConfig.value ? modelLabel(deletingModelConfig.value.modelId) : '该 LLM');
 
 /** 获取模型弹窗对应配置中已存在的模型 ID，用于在弹窗中标记「已添加」状态。 */
@@ -146,70 +120,8 @@ function formatModelTime(value: string | undefined): string {
   });
 }
 
-
-function updateActiveConfigField<K extends keyof LlmProviderConfigRecord>(key: K, value: LlmProviderConfigRecord[K]): void {
-  settings.updateActiveLlmProviderConfig({ [key]: value } as Partial<LlmProviderConfigRecord>);
-}
-
-function updateDefaultAdvancedPatch(patch: AdvancedConfigPatch): void {
-  settings.updateActiveLlmProviderConfig(patch);
-}
-
-function updateDefaultContextWindowTokens(value: number | undefined): void {
-  settings.updateActiveLlmContextWindowTokens(value);
-}
-
-function updateDefaultGenerationConfig(value: LlmGenerationConfigRecord | undefined): void {
-  settings.updateActiveLlmGenerationConfig(value);
-}
-
-function updateDefaultRequestBody(value: LlmRequestBodyRecord | undefined): void {
-  settings.updateActiveLlmRequestBody(value);
-}
-
-function updateDefaultPromptCache(value: LlmPromptCacheConfigRecord | undefined): void {
-  settings.updateActiveLlmPromptCache(value);
-}
-
-function updateDefaultNativeResponses(value: OpenAIResponsesNativeSettings | undefined): void {
-  settings.updateActiveLlmNativeResponses(value);
-}
-
-function updateDefaultHeaders(value: LlmProviderHeadersRecord | undefined): void {
-  settings.updateActiveLlmHeaders(value);
-}
-
-function updateModelAdvancedPatch(modelConfigId: string, patch: Partial<LlmProviderModelConfigRecord>): void {
-  settings.updateActiveModelConfig(modelConfigId, patch);
-}
-
-function updateModelContextWindowTokens(modelConfigId: string, value: number | undefined): void {
-  settings.updateActiveModelConfigContextWindowTokens(modelConfigId, value);
-}
-
-function updateModelGenerationConfig(modelConfigId: string, value: LlmGenerationConfigRecord | undefined): void {
-  settings.updateActiveModelConfigGenerationConfig(modelConfigId, value);
-}
-
-function updateModelRequestBody(modelConfigId: string, value: LlmRequestBodyRecord | undefined): void {
-  settings.updateActiveModelConfigRequestBody(modelConfigId, value);
-}
-
-function updateModelPromptCache(modelConfigId: string, value: LlmPromptCacheConfigRecord | undefined): void {
-  settings.updateActiveModelConfigPromptCache(modelConfigId, value);
-}
-
-function updateModelNativeResponses(modelConfigId: string, value: OpenAIResponsesNativeSettings | undefined): void {
-  settings.updateActiveModelConfigNativeResponses(modelConfigId, value);
-}
-
-function updateModelHeaders(modelConfigId: string, value: LlmProviderHeadersRecord | undefined): void {
-  settings.updateActiveModelConfigHeaders(modelConfigId, value);
-}
-
-function normalizeTokenCount(value: unknown): number | undefined {
-  const number = Number(value);
-  return Number.isFinite(number) && number > 0 ? Math.floor(number) : undefined;
+function updateConfigField<K extends keyof LlmProviderConfigRecord>(key: K, value: LlmProviderConfigRecord[K]): void {
+  settings.updateActiveLlmProviderConfig({ [key]: value } as Partial<LlmProviderConfigRecord>, editingConfigId.value);
 }
 
 function inputValue(event: Event): string {
@@ -217,71 +129,18 @@ function inputValue(event: Event): string {
 }
 
 function modelLabel(modelId: string): string {
-  const model = activeConfig.value?.models.find((candidate) => candidate.id === modelId);
+  const model = editingConfig.value?.models.find((candidate) => candidate.id === modelId);
   return model?.name?.trim() || modelId;
 }
 
-function modelConfigDescription(modelConfig: LlmProviderModelConfigRecord): string {
-  return `LLM ID：${modelConfig.modelId} · 使用该 LLM 时完整替代渠道默认配置与上下文压缩`;
-}
-
-function modelConfigAsProviderConfig(modelConfig: LlmProviderModelConfigRecord): LlmProviderConfigRecord {
-  const base = activeConfig.value;
-  const now = Date.now();
-  return {
-    id: base?.id ?? modelConfig.id,
-    name: base ? `${base.name} · ${modelLabel(modelConfig.modelId)}` : modelLabel(modelConfig.modelId),
-    provider: base?.provider ?? 'openai-compatible',
-    baseUrl: base?.baseUrl ?? '',
-    model: modelConfig.modelId,
-    models: base?.models ?? [],
-    apiKey: base?.apiKey ?? '',
-    toolCallFormat: modelConfig.toolCallFormat,
-    openaiResponsesTransport: modelConfig.openaiResponsesTransport,
-    stream: modelConfig.stream,
-    retryOnError: modelConfig.retryOnError,
-    retryForceAllErrors: modelConfig.retryForceAllErrors === true,
-    retryMaxAttempts: modelConfig.retryMaxAttempts,
-    retryDelaySeconds: modelConfig.retryDelaySeconds,
-    enableMultimodalTools: modelConfig.enableMultimodalTools,
-    contextWindowTokens: modelConfig.contextWindowTokens,
-    systemPromptPrefix: modelConfig.systemPromptPrefix,
-    promptCache: modelConfig.promptCache,
-    ...(modelConfig.nativeResponses ? { nativeResponses: { ...modelConfig.nativeResponses } } : {}),
-    // 模型级配置缺省时跟随渠道，与运行时冻结的取值一致。
-    ...((modelConfig.claudeTurnScopedReminders ?? base?.claudeTurnScopedReminders) === true ? { claudeTurnScopedReminders: true } : {}),
-    ...((modelConfig.openaiCompatibleThinkingFormat ?? base?.openaiCompatibleThinkingFormat)
-      ? { openaiCompatibleThinkingFormat: modelConfig.openaiCompatibleThinkingFormat ?? base?.openaiCompatibleThinkingFormat } : {}),
-    headers: modelConfig.headers ?? {},
-    generationConfig: modelConfig.generationConfig ?? {},
-    requestBody: modelConfig.requestBody ?? {},
-    modelConfigs: [],
-    createdAt: modelConfig.createdAt || now,
-    updatedAt: modelConfig.updatedAt || now
-  };
-}
-
-function isModelConfigOpen(modelConfigId: string): boolean {
-  return modelSpecificPanelOpen.value[modelConfigId] ?? true;
-}
-
-function toggleModelConfig(modelConfigId: string): void {
-  modelSpecificPanelOpen.value = {
-    ...modelSpecificPanelOpen.value,
-    [modelConfigId]: !isModelConfigOpen(modelConfigId)
-  };
-}
-
 function createModelSpecificConfig(): void {
-  const modelId = selectedNewModelSpecificModelId.value;
+  const modelId = editorModelId.value;
   if (!modelId) return;
-  const created = settings.createModelConfigForActiveConfig(modelId);
-  if (!created) return;
-  modelSpecificPanelOpen.value = { ...modelSpecificPanelOpen.value, [created.id]: true };
-  newModelSpecificModelId.value = '';
+  settings.createModelConfigForActiveConfig(modelId, editingConfigId.value);
 }
 
 function openDeleteModelConfigConfirm(modelConfigId: string): void {
+  dialogProviderConfigId.value = editingConfigId.value;
   deletingModelConfigId.value = modelConfigId;
   deleteModelConfigConfirmOpen.value = true;
 }
@@ -291,7 +150,7 @@ function confirmDeleteModelConfig(): void {
   deleteModelConfigConfirmOpen.value = false;
   deletingModelConfigId.value = '';
   if (!id) return;
-  settings.deleteModelConfigFromActiveConfig(id);
+  settings.deleteModelConfigFromActiveConfig(id, dialogProviderConfigId.value);
 }
 
 function cancelDeleteModelConfig(): void {
@@ -301,83 +160,6 @@ function cancelDeleteModelConfig(): void {
 
 function providerLabel(provider: LlmProviderKind | undefined): string {
   return providerOptions.find((option) => option.value === provider)?.label ?? '未知渠道';
-}
-
-function modelCompressionConfig(modelId: string): LlmCompressionConfigRecord | undefined {
-  return settings.compressionConfigForActiveModel(modelId);
-}
-
-function updateDefaultCompressionProviderConfigId(providerConfigId: string): void {
-  settings.setActiveCompressionProviderConfig(providerConfigId);
-}
-
-function updateDefaultCompressionMethodKind(kind: SelectableCompressionMethodKind): void {
-  settings.setActiveCompressionMethodKind(kind);
-}
-
-function updateDefaultCompressionTrigger(patch: Partial<LlmCompressionConfigRecord['trigger']>): void {
-  settings.updateActiveCompressionTrigger(patch);
-}
-
-function updateDefaultCompressionMaxDurationMinutes(value: number): void {
-  settings.setActiveCompressionMaxDurationMinutes(value);
-}
-
-function updateDefaultCompressionBodyTargetTokens(value: number): void {
-  settings.setActiveCompressionBodyTargetTokens(value);
-}
-
-function updateDefaultCompressionNativeTrustMode(value: LlmNativeCompactionTrustMode): void {
-  settings.setActiveCompressionNativeTrustMode(value);
-}
-
-function updateDefaultCompressionSummaryReasoningMode(value: LlmSummaryReasoningMode): void {
-  settings.setActiveCompressionSummaryReasoningMode(value);
-}
-
-function updateDefaultCompressionFallbacks(values: LlmCompressionFallbackKind[]): void {
-  settings.setActiveCompressionFallbacks(values);
-}
-
-function updateModelCompressionProviderConfigId(modelId: string, providerConfigId: string): void {
-  settings.setModelCompressionProviderConfig(modelId, providerConfigId);
-}
-
-function updateModelCompressionMethodKind(modelId: string, kind: SelectableCompressionMethodKind): void {
-  settings.setModelCompressionMethodKind(modelId, kind);
-}
-
-function updateModelCompressionTrigger(modelId: string, patch: Partial<LlmCompressionConfigRecord['trigger']>): void {
-  settings.updateModelCompressionTrigger(modelId, patch);
-}
-
-function updateModelCompressionMaxDurationMinutes(modelId: string, value: number): void {
-  settings.setModelCompressionMaxDurationMinutes(modelId, value);
-}
-
-function updateModelCompressionBodyTargetTokens(modelId: string, value: number): void {
-  settings.setModelCompressionBodyTargetTokens(modelId, value);
-}
-
-function updateModelCompressionNativeTrustMode(
-  modelId: string,
-  value: LlmNativeCompactionTrustMode
-): void {
-  settings.setModelCompressionNativeTrustMode(modelId, value);
-}
-
-function updateModelCompressionSummaryReasoningMode(
-  modelId: string,
-  value: LlmSummaryReasoningMode
-): void {
-  settings.setModelCompressionSummaryReasoningMode(modelId, value);
-}
-
-function updateModelCompressionFallbacks(
-  modelId: string,
-  values: LlmCompressionFallbackKind[]
-): void {
-  settings.setModelCompressionFallbacks(modelId, values);
 }
 
 function openCreate(): void {
@@ -391,7 +173,7 @@ function confirmCreate(name: string): void {
   const preset = createProvider.value === 'openai-compatible'
     ? OPENAI_COMPATIBLE_SERVICE_PRESETS.find((candidate) => candidate.key === createService.value)
     : undefined;
-  settings.createLlmProviderConfig(name, createProvider.value, preset?.baseUrl);
+  editingConfigId.value = settings.createLlmProviderConfig(name, createProvider.value, preset?.baseUrl);
 }
 
 function cancelCreate(): void {
@@ -403,13 +185,14 @@ function updateCreateProvider(value: string): void {
 }
 
 function openNewModel(): void {
+  dialogProviderConfigId.value = editingConfigId.value;
   newModelName.value = '';
   newModelOpen.value = true;
 }
 
 function confirmNewModel(modelId: string): void {
   newModelOpen.value = false;
-  settings.addModelToActiveConfig(modelId, newModelName.value);
+  settings.addModelToActiveConfig(modelId, newModelName.value, dialogProviderConfigId.value);
   newModelName.value = '';
 }
 
@@ -423,13 +206,14 @@ function updateNewModelName(event: Event): void {
 }
 
 function openClearModelsConfirm(): void {
+  dialogProviderConfigId.value = editingConfigId.value;
   if (!canClearModels.value) return;
   clearModelsConfirmOpen.value = true;
 }
 
 function confirmClearModels(): void {
   clearModelsConfirmOpen.value = false;
-  settings.clearModelsFromActiveConfig();
+  settings.clearModelsFromActiveConfig(dialogProviderConfigId.value);
 }
 
 function cancelClearModels(): void {
@@ -437,16 +221,17 @@ function cancelClearModels(): void {
 }
 
 function removeModel(modelId: string): void {
-  settings.removeModelFromActiveConfig(modelId);
+  settings.removeModelFromActiveConfig(modelId, editingConfigId.value);
 }
 
 function openRename(): void {
-  if (!activeConfig.value) return;
+  dialogProviderConfigId.value = editingConfigId.value;
+  if (!editingConfig.value) return;
   renameOpen.value = true;
 }
 
 function confirmRename(name: string): void {
-  const config = activeConfig.value;
+  const config = settings.llmProviderConfigs.configs.find(item => item.id === dialogProviderConfigId.value);
   renameOpen.value = false;
   if (!config) return;
   settings.renameLlmProviderConfig(config.id, name);
@@ -457,12 +242,13 @@ function cancelRename(): void {
 }
 
 function openDeleteConfirm(): void {
-  if (!canDeleteActiveConfig.value) return;
+  dialogProviderConfigId.value = editingConfigId.value;
+  if (!canDeleteConfig.value) return;
   deleteConfirmOpen.value = true;
 }
 
 function confirmDelete(): void {
-  const config = activeConfig.value;
+  const config = settings.llmProviderConfigs.configs.find(item => item.id === dialogProviderConfigId.value);
   deleteConfirmOpen.value = false;
   if (!config) return;
   settings.deleteLlmProviderConfig(config.id);
@@ -476,7 +262,7 @@ function cancelDelete(): void {
   deleteConfirmOpen.value = false;
 }
 
-const isOpenAICompatibleChannel = computed(() => activeConfig.value?.provider === 'openai-compatible');
+const isOpenAICompatibleChannel = computed(() => editingConfig.value?.provider === 'openai-compatible');
 const thinkingTestDescription = computed(() =>
   `会向「${modelLabel(thinkingTestModelId.value)}」发送最多 ${OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS} 次很短的请求（每次只有一句“Reply with OK.”，看到第一段回复就断开），`
   + '测出它用哪种思考参数写法、能不能关闭思考、接受哪些思考强度，可能产生少量费用。'
@@ -489,12 +275,12 @@ const thinkingTestTooltipRows = [
 ];
 
 function thinkingProbeFor(modelId: string) {
-  const config = activeConfig.value;
+  const config = editingConfig.value;
   return config ? settings.thinkingProbeState(config.id, modelId) : undefined;
 }
 
 function thinkingProbeEvidenceFor(modelId: string) {
-  const config = activeConfig.value;
+  const config = editingConfig.value;
   return config ? openAICompatibleThinkingProbeEvidence(config, modelId) : undefined;
 }
 
@@ -515,14 +301,16 @@ function thinkingProbeRows(modelId: string) {
   ];
 }
 
-function openThinkingTest(modelId: string): void {
-  if (!isOpenAICompatibleChannel.value || !modelId.trim() || thinkingProbeFor(modelId)?.status === 'running') return;
+function openThinkingTest(modelId: string, providerConfigId = editingConfigId.value): void {
+  const provider = settings.llmProviderConfigs.configs.find(item => item.id === providerConfigId);
+  if (provider?.provider !== 'openai-compatible' || !modelId.trim() || settings.thinkingProbeState(providerConfigId, modelId)?.status === 'running') return;
+  dialogProviderConfigId.value = providerConfigId;
   thinkingTestModelId.value = modelId;
   thinkingTestConfirmOpen.value = true;
 }
 
 function confirmThinkingTest(): void {
-  const config = activeConfig.value;
+  const config = settings.llmProviderConfigs.configs.find(item => item.id === dialogProviderConfigId.value);
   const modelId = thinkingTestModelId.value;
   thinkingTestConfirmOpen.value = false;
   thinkingTestModelId.value = '';
@@ -547,7 +335,7 @@ function cancelThinkingTest(): void {
             :text="channelLoadingText"
           />
         </div>
-        <p>配置全局范围内可复用的 LLM 渠道。后续 Agent、Workflow 或其他对象可通过关系数据复用这些配置。</p>
+        <p>浏览和编辑不切换默认渠道或模型；修改已在使用的配置会照常保存生效。</p>
       </div>
     </header>
 
@@ -555,11 +343,11 @@ function cancelThinkingTest(): void {
       <div class="channel-content" :aria-busy="channelLoading">
         <div class="channel-config-picker">
       <label class="global-settings-field channel-config-select">
-        <span>配置页</span>
+        <span>编辑渠道</span>
         <SettingsDropdown
-          v-model="activeConfigId"
+          v-model="editingConfigId"
           :options="configPageOptions"
-          title="切换配置页"
+          title="选择要编辑的渠道"
           empty-text="暂无渠道配置。"
           searchable
           search-placeholder="筛选配置页…"
@@ -567,32 +355,35 @@ function cancelThinkingTest(): void {
       </label>
 
       <div class="channel-config-actions" aria-label="渠道配置页操作">
+        <button type="button" class="model-manager-button" :disabled="!editingConfig || settings.llm.activeProviderConfigId === editingConfig.id" @click="settings.selectLlmProviderConfig(editingConfigId)">
+          {{ settings.llm.activeProviderConfigId === editingConfigId ? '全局默认渠道' : '设为默认渠道' }}
+        </button>
         <button type="button" class="icon-action" aria-label="新建配置页" @click="openCreate">
           <IconPlus stroke="2" aria-hidden="true" />
         </button>
-        <button type="button" class="icon-action" aria-label="重命名配置页" :disabled="!activeConfig" @click="openRename">
+        <button type="button" class="icon-action" aria-label="重命名配置页" :disabled="!editingConfig" @click="openRename">
           <IconPencil stroke="2" aria-hidden="true" />
         </button>
-        <button type="button" class="icon-action" aria-label="删除配置页" :disabled="!canDeleteActiveConfig" @click="openDeleteConfirm">
+        <button type="button" class="icon-action" aria-label="删除配置页" :disabled="!canDeleteConfig" @click="openDeleteConfirm">
           <IconTrash stroke="2" aria-hidden="true" />
         </button>
       </div>
     </div>
 
-    <div v-if="activeConfig" class="global-settings-grid">
+    <div v-if="editingConfig" class="global-settings-grid">
       <label class="global-settings-field global-settings-field-wide">
         <span>渠道类型</span>
-        <input :value="activeProviderLabel" type="text" readonly />
+        <input :value="editingProviderLabel" type="text" readonly />
       </label>
 
       <label class="global-settings-field global-settings-field-wide">
         <span>接口地址（Base URL）</span>
-        <input :value="activeConfig.baseUrl" type="text" placeholder="https://api.openai.com/v1" @input="updateActiveConfigField('baseUrl', inputValue($event))" />
+        <input :value="editingConfig.baseUrl" type="text" placeholder="https://api.openai.com/v1" @input="updateConfigField('baseUrl', inputValue($event))" />
       </label>
 
       <label class="global-settings-field global-settings-api-key-field global-settings-field-wide">
         <span>API 密钥</span>
-        <input :value="activeConfig.apiKey" type="text" placeholder="sk-..." autocomplete="off" spellcheck="false" @input="updateActiveConfigField('apiKey', inputValue($event))" />
+        <input :value="editingConfig.apiKey" type="text" placeholder="sk-..." autocomplete="off" spellcheck="false" @input="updateConfigField('apiKey', inputValue($event))" />
       </label>
 
       <section class="model-manager global-settings-field-wide" aria-label="LLM 列表">
@@ -603,7 +394,7 @@ function cancelThinkingTest(): void {
               <IconPlus stroke="2" aria-hidden="true" />
               <span>新建 LLM</span>
             </button>
-            <button type="button" class="model-manager-button" @click="settings.requestModelsForActiveConfig()">
+            <button type="button" class="model-manager-button" @click="settings.requestModelsForActiveConfig(editingConfigId)">
               <IconCloudDown stroke="2" aria-hidden="true" />
               <span>获取 LLM</span>
             </button>
@@ -629,12 +420,12 @@ function cancelThinkingTest(): void {
                   v-for="model in filteredModels"
                   :key="model.id"
                   class="model-item"
-                  :class="{ enabled: model.id === activeConfig.model, 'has-model-config': activeModelConfigs.some((config) => config.modelId === model.id) }"
+                  :class="{ enabled: model.id === editorModelId, 'has-model-config': editingModelConfigs.some((config) => config.modelId === model.id) }"
                   role="button"
                   tabindex="0"
-                  @click="settings.selectActiveConfigModel(model.id)"
-                  @keydown.enter.prevent="settings.selectActiveConfigModel(model.id)"
-                  @keydown.space.prevent="settings.selectActiveConfigModel(model.id)"
+                  @click="editorModelId = model.id"
+                  @keydown.enter.prevent="editorModelId = model.id"
+                  @keydown.space.prevent="editorModelId = model.id"
                 >
                   <span class="model-status" aria-hidden="true"></span>
                   <span class="model-info">
@@ -659,9 +450,12 @@ function cancelThinkingTest(): void {
                     </span>
                     <span class="model-id">ID: {{ model.id }}</span>
                     <span v-if="model.createdAt" class="model-time">时间：{{ formatModelTime(model.createdAt) }}</span>
-                    <span v-if="activeModelConfigs.some((config) => config.modelId === model.id)" class="model-time">已设置 LLM 专属配置</span>
+                    <span v-if="editingModelConfigs.some((config) => config.modelId === model.id)" class="model-time">已设置 LLM 专属配置</span>
                   </span>
                   <span class="model-actions">
+                    <button type="button" class="model-test-btn" :disabled="model.id === editingConfig.model" @click.stop="settings.selectLlmProviderConfigModel(editingConfig.id, model.id)" @keydown.enter.stop @keydown.space.stop>
+                      {{ model.id === editingConfig.model ? '渠道默认' : '设为默认模型' }}
+                    </button>
                     <HoverTooltipPanel
                       v-if="isOpenAICompatibleChannel"
                       panel-title="测试这个模型"
@@ -695,138 +489,29 @@ function cancelThinkingTest(): void {
         </div>
       </section>
 
-      <section class="channel-config-groups global-settings-field-wide" aria-label="LLM 配置分组">
-        <article class="settings-collapse-panel">
-          <header class="settings-collapse-head">
-            <button type="button" class="settings-collapse-toggle" :aria-expanded="defaultConfigOpen" @click="defaultConfigOpen = !defaultConfigOpen">
-              <IconChevronDown class="settings-collapse-caret" :class="{ collapsed: !defaultConfigOpen }" stroke="2" aria-hidden="true" />
-              <span class="settings-collapse-title-wrap">
-                <span class="settings-collapse-title">渠道默认配置</span>
-                <span class="settings-collapse-desc">当前渠道的默认高级配置与上下文压缩；未设置 LLM 专属配置时使用这里。</span>
-              </span>
-            </button>
-          </header>
-          <div v-if="defaultConfigOpen" class="settings-collapse-body">
-            <LlmAdvancedConfigEditor
-              :config="activeConfig"
-              :thinking-probe="thinkingProbeFor(activeConfig.model)"
-              @test-thinking="openThinkingTest(activeConfig.model)"
-              @update-field="updateDefaultAdvancedPatch"
-              @update-context-window-tokens="updateDefaultContextWindowTokens"
-              @update-generation-config="updateDefaultGenerationConfig"
-              @update-request-body="updateDefaultRequestBody"
-              @update-prompt-cache="updateDefaultPromptCache"
-              @update-native-responses="updateDefaultNativeResponses"
-              @update-headers="updateDefaultHeaders"
-            />
-            <LlmCompressionSettingsEditor
-              @verify-native="(configId, modelId) => settings.verifyNativeCompressionCapability(configId, modelId)"
-              class="advanced-compression-editor"
-              :config="settings.activeCompressionConfig"
-              :current-provider-config="activeConfig"
-              :provider-configs="settings.llmProviderConfigs.configs"
-              :context-window-tokens="contextWindowTokens"
-              @update-provider-config-id="updateDefaultCompressionProviderConfigId"
-              @update-method-kind="updateDefaultCompressionMethodKind"
-              @update-trigger="updateDefaultCompressionTrigger"
-              @update-max-duration-minutes="updateDefaultCompressionMaxDurationMinutes"
-              @update-body-target-tokens="updateDefaultCompressionBodyTargetTokens"
-              @update-native-trust-mode="updateDefaultCompressionNativeTrustMode"
-              @update-summary-reasoning-mode="updateDefaultCompressionSummaryReasoningMode"
-              @update-summary-generation-config="settings.setActiveCompressionSummaryGenerationConfig($event)"
-              @update-fallbacks="updateDefaultCompressionFallbacks"
-            />
-          </div>
-        </article>
-
-        <article class="settings-collapse-panel model-specific-group-panel">
-          <header class="settings-collapse-head">
-            <button type="button" class="settings-collapse-toggle" :aria-expanded="modelSpecificGroupOpen" @click="modelSpecificGroupOpen = !modelSpecificGroupOpen">
-              <IconChevronDown class="settings-collapse-caret" :class="{ collapsed: !modelSpecificGroupOpen }" stroke="2" aria-hidden="true" />
-              <span class="settings-collapse-title-wrap">
-                <span class="settings-collapse-title">LLM 专属配置</span>
-                <span class="settings-collapse-desc">为某个 LLM 创建独立配置；使用该 LLM 时会完整替代渠道默认配置和上下文压缩设置。</span>
-              </span>
-            </button>
-          </header>
-
-          <div v-if="modelSpecificGroupOpen" class="settings-collapse-body model-specific-body">
-            <div class="model-specific-create-row">
-              <label class="global-settings-field model-specific-select-field">
-                <span>选择 LLM</span>
-                <SettingsDropdown
-                  v-model="selectedNewModelSpecificModelId"
-                  :options="modelSpecificOptions"
-                  title="选择要创建专属配置的 LLM"
-                  empty-text="当前 LLM 列表没有可创建专属配置的 LLM。"
-                  searchable
-                  search-placeholder="筛选 LLM…"
-                  placement="top"
-                />
-              </label>
-              <button type="button" class="model-manager-button model-specific-create-button" :disabled="!canCreateModelSpecificConfig" @click="createModelSpecificConfig">
-                <IconPlus stroke="2" aria-hidden="true" />
-                <span>创建 LLM 配置</span>
-              </button>
-            </div>
-
-            <p class="model-specific-note">
-              LLM 专属配置是完整配置副本：前置系统提示词、请求头、请求体、重试、多模态、上下文窗口、提示词缓存与上下文压缩都会替代默认配置；空前置提示词表示不注入，空请求头或请求体表示不使用默认值。
-            </p>
-
-            <div v-if="!activeModelConfigs.length" class="model-specific-empty">暂无 LLM 专属配置。</div>
-
-            <article v-for="modelConfig in activeModelConfigs" :key="modelConfig.id" class="settings-collapse-panel model-config-panel">
-              <header class="settings-collapse-head model-config-head">
-                <button type="button" class="settings-collapse-toggle" :aria-expanded="isModelConfigOpen(modelConfig.id)" @click="toggleModelConfig(modelConfig.id)">
-                  <IconChevronDown class="settings-collapse-caret" :class="{ collapsed: !isModelConfigOpen(modelConfig.id) }" stroke="2" aria-hidden="true" />
-                  <span class="settings-collapse-title-wrap">
-                    <span class="settings-collapse-title">{{ modelLabel(modelConfig.modelId) }}</span>
-                    <span class="settings-collapse-desc">{{ modelConfigDescription(modelConfig) }}</span>
-                  </span>
-                </button>
-                <button type="button" class="icon-action model-config-delete" aria-label="删除 LLM 专属配置" @click="openDeleteModelConfigConfirm(modelConfig.id)">
-                  <IconTrash stroke="2" aria-hidden="true" />
-                </button>
-              </header>
-
-              <div v-if="isModelConfigOpen(modelConfig.id)" class="settings-collapse-body model-config-body">
-                <LlmAdvancedConfigEditor
-                  :config="modelConfigAsProviderConfig(modelConfig)"
-                  :thinking-probe="thinkingProbeFor(modelConfig.modelId)"
-                  @test-thinking="openThinkingTest(modelConfig.modelId)"
-                  @update-field="updateModelAdvancedPatch(modelConfig.id, $event)"
-                  @update-context-window-tokens="updateModelContextWindowTokens(modelConfig.id, $event)"
-                  @update-generation-config="updateModelGenerationConfig(modelConfig.id, $event)"
-                  @update-request-body="updateModelRequestBody(modelConfig.id, $event)"
-                  @update-prompt-cache="updateModelPromptCache(modelConfig.id, $event)"
-                  @update-native-responses="updateModelNativeResponses(modelConfig.id, $event)"
-                  @update-headers="updateModelHeaders(modelConfig.id, $event)"
-                />
-                <LlmCompressionSettingsEditor
-                  @verify-native="(configId, modelId) => settings.verifyNativeCompressionCapability(configId, modelId)"
-                  class="advanced-compression-editor"
-                  :config="modelCompressionConfig(modelConfig.modelId)"
-                  :current-provider-config="modelConfigAsProviderConfig(modelConfig)"
-                  :provider-configs="settings.llmProviderConfigs.configs"
-                  :context-window-tokens="normalizeTokenCount(modelConfig.contextWindowTokens) ?? 0"
-                  @update-provider-config-id="updateModelCompressionProviderConfigId(modelConfig.modelId, $event)"
-                  @update-method-kind="updateModelCompressionMethodKind(modelConfig.modelId, $event)"
-                  @update-trigger="updateModelCompressionTrigger(modelConfig.modelId, $event)"
-                  @update-max-duration-minutes="updateModelCompressionMaxDurationMinutes(modelConfig.modelId, $event)"
-                  @update-body-target-tokens="updateModelCompressionBodyTargetTokens(modelConfig.modelId, $event)"
-                  @update-native-trust-mode="updateModelCompressionNativeTrustMode(modelConfig.modelId, $event)"
-                  @update-summary-reasoning-mode="updateModelCompressionSummaryReasoningMode(modelConfig.modelId, $event)"
-                  @update-summary-generation-config="settings.setModelCompressionSummaryGenerationConfig(modelConfig.modelId, $event)"
-                  @update-fallbacks="updateModelCompressionFallbacks(modelConfig.modelId, $event)"
-                />
-              </div>
-            </article>
-          </div>
-        </article>
+      <section class="channel-config-groups global-settings-field-wide" aria-label="配置编辑目标">
+        <label class="global-settings-field">
+          <span>编辑目标</span>
+          <SettingsDropdown v-model="editorModelId" :options="editorTargetOptions" title="编辑渠道默认或模型独立配置" searchable />
+        </label>
+        <template v-if="editorModelId">
+          <p v-if="selectedModelConfig">此模型使用独立完整副本，不与渠道默认配置合并。</p>
+          <p v-else>此模型使用渠道默认配置。需要不同参数时，明确创建独立副本。</p>
+          <button v-if="!selectedModelConfig" type="button" class="model-manager-button" @click="createModelSpecificConfig">从渠道默认复制为独立配置</button>
+          <button v-else type="button" class="model-manager-button" @click="openDeleteModelConfigConfirm(selectedModelConfig.id)">删除独立配置…</button>
+          <button v-if="!selectedModelConfig" type="button" class="model-manager-button" @click="editorModelId = ''">编辑渠道默认配置</button>
+        </template>
+        <KeepAlive>
+          <ChannelConfigEditor
+            v-if="!editorModelId || selectedModelConfig"
+            :key="`${editingConfig.id}:${selectedModelConfig?.id ?? 'default'}`"
+            :provider-config-id="editingConfig.id"
+            :model-config-id="selectedModelConfig?.id"
+            @test-thinking="openThinkingTest"
+          />
+        </KeepAlive>
       </section>
     </div>
-
 
 
     <div v-else class="global-settings-empty">暂无渠道配置，请新建一个配置页。</div>
@@ -836,14 +521,6 @@ function cancelThinkingTest(): void {
       <span class="global-settings-status">{{ settings.status || '渠道配置会自动保存' }}</span>
     </div>
 
-    <div class="global-settings-path-list" aria-label="渠道配置路径信息">
-      <p class="global-settings-path">
-        当前配置选择：<code>{{ settings.filePaths.llm || '正在获取当前渠道配置路径…' }}</code>
-      </p>
-      <p class="global-settings-path">
-        渠道配置页：<code>{{ settings.filePaths.llmProviderConfigs || '正在获取模型渠道配置路径…' }}</code>
-      </p>
-    </div>
       </div>
     </div>
 
@@ -883,12 +560,11 @@ function cancelThinkingTest(): void {
       </label>
     </InputPanel>
 
-
     <InputPanel
       :open="renameOpen"
       title="重命名配置页"
       label="配置页名称"
-      :initial-value="activeConfig?.name ?? ''"
+      :initial-value="dialogConfig?.name ?? ''"
       placeholder="输入配置页名称"
       confirm-label="保存名称"
       @confirm="confirmRename"
@@ -905,11 +581,10 @@ function cancelThinkingTest(): void {
       @cancel="cancelClearModels"
     />
 
-
     <ConfirmPanel
       :open="deleteConfirmOpen"
       title="删除配置页？"
-      :description-html="`将删除「${activeConfig?.name ?? '当前配置'}」这个渠道配置页，此操作<strong>无法撤销</strong>。`"
+      :description="`将删除「${dialogConfig?.name ?? '当前配置'}」这个渠道配置页，此操作无法撤销。`"
       confirm-label="删除"
       cancel-label="取消"
       @confirm="confirmDelete"
@@ -919,7 +594,7 @@ function cancelThinkingTest(): void {
     <ConfirmPanel
       :open="deleteModelConfigConfirmOpen"
       title="删除 LLM 专属配置？"
-      :description-html="`将删除「${deletingModelConfigLabel}」的 LLM 专属配置。删除后该 LLM 会重新使用渠道默认配置，此操作<strong>无法撤销</strong>。`"
+      :description="`将删除「${deletingModelConfigLabel}」的 LLM 专属配置。删除后该 LLM 会重新使用渠道默认配置，此操作无法撤销。`"
       confirm-label="删除"
       cancel-label="取消"
       @confirm="confirmDeleteModelConfig"
@@ -952,131 +627,6 @@ function cancelThinkingTest(): void {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-}
-
-.settings-collapse-panel {
-  border: 1px solid var(--vscode-panel-border);
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--vscode-editor-background) 95%, var(--vscode-foreground) 5%);
-  overflow: hidden;
-}
-
-.settings-collapse-head {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: stretch;
-  border-bottom: 1px solid transparent;
-}
-
-.settings-collapse-toggle {
-  min-width: 0;
-  border: 0;
-  padding: var(--space-3);
-  display: grid;
-  grid-template-columns: 18px minmax(0, 1fr);
-  gap: var(--space-2);
-  align-items: start;
-  color: var(--vscode-foreground);
-  background: transparent;
-  text-align: left;
-}
-
-.settings-collapse-toggle:hover,
-.settings-collapse-toggle:focus-visible,
-.model-config-delete:hover,
-.model-config-delete:focus-visible {
-  background: var(--vscode-list-hoverBackground, color-mix(in srgb, var(--vscode-editor-background) 88%, var(--vscode-foreground) 12%));
-  outline: none;
-}
-
-.settings-collapse-caret {
-  width: 16px;
-  height: 16px;
-  margin-top: 1px;
-  transition: transform 0.16s ease;
-}
-
-.settings-collapse-caret.collapsed {
-  transform: rotate(-90deg);
-}
-
-.settings-collapse-title-wrap {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.settings-collapse-title {
-  font-size: var(--font-size-sm);
-  font-weight: 650;
-  line-height: 1.35;
-}
-
-.settings-collapse-desc,
-.model-specific-note {
-  color: var(--vscode-descriptionForeground);
-  font-size: var(--font-size-xs);
-  line-height: 1.45;
-}
-
-.settings-collapse-body {
-  padding: var(--space-3);
-  border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 72%, transparent);
-}
-
-.model-specific-group-panel {
-  overflow: visible;
-}
-
-.model-specific-body {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-}
-
-.model-specific-create-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: var(--space-2);
-  align-items: end;
-}
-
-.model-specific-create-button {
-  min-height: 30px;
-  margin-bottom: 0;
-}
-
-.model-specific-note {
-  margin: 0;
-}
-
-.model-specific-empty {
-  border: 1px dashed var(--vscode-panel-border);
-  border-radius: var(--radius-sm);
-  padding: var(--space-3);
-  color: var(--vscode-descriptionForeground);
-  font-size: var(--font-size-sm);
-}
-
-.model-config-panel {
-  background: color-mix(in srgb, var(--vscode-editor-background) 97%, var(--vscode-foreground) 3%);
-}
-
-.model-config-head {
-  grid-template-columns: minmax(0, 1fr) 34px;
-}
-
-.model-config-delete {
-  align-self: stretch;
-  width: 34px;
-  height: auto;
-  border-left: 1px solid color-mix(in srgb, var(--vscode-panel-border) 68%, transparent);
-  border-radius: 0;
-}
-
-.model-config-body {
-  background: color-mix(in srgb, var(--vscode-editor-background) 98%, var(--vscode-foreground) 2%);
 }
 
 .model-name-row {
@@ -1131,17 +681,4 @@ function cancelThinkingTest(): void {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-foreground) 22%, transparent);
 }
 
-.advanced-compression-editor {
-  margin-top: var(--space-3);
-}
-
-@media (max-width: 720px) {
-  .model-specific-create-row {
-    grid-template-columns: 1fr;
-  }
-
-  .model-specific-create-button {
-    justify-self: start;
-  }
-}
 </style>

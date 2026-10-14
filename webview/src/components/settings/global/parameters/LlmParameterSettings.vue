@@ -1,19 +1,21 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
 import { IconPlus } from '@tabler/icons-vue';
-import type { LlmGenerationConfigRecord, LlmProviderConfigRecord, LlmRequestBodyRecord } from '@shared/protocol';
-import { resolveProviderModelCapabilities, thinkingConfigSupported } from '@shared/modelCapabilities';
+import type { LlmGenerationConfigRecord, LlmProviderConfigRecord, LlmRequestBodyRecord, LlmThinkingLevel } from '@shared/protocol';
+import { anthropicRejectsNonDefaultSampling, resolveProviderModelCapabilities, resolveProviderOpenAICompatibleDialect, thinkingConfigSupported } from '@shared/modelCapabilities';
+import { sessionThinkingCapability, sessionThinkingDisplayLabel, validateSessionThinkingOverride } from '@shared/sessionThinking';
+import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
+import LlmSettingHint from './LlmSettingHint.vue';
 import LlmKnownParameterRow from './LlmKnownParameterRow.vue';
 import LlmCustomRequestBodyEditor from './LlmCustomRequestBodyEditor.vue';
-import LlmParameterAddPanel, { type LlmParameterAddOption } from './LlmParameterAddPanel.vue';
 import {
-  labelForProvider,
   parameterDefinitionsForProvider,
   type LlmParameterDefinition
 } from './llmParameterDefinitions';
 
 const props = defineProps<{
   config: LlmProviderConfigRecord;
+  section?: 'generation' | 'request-body';
 }>();
 
 const emit = defineEmits<{
@@ -21,25 +23,58 @@ const emit = defineEmits<{
   (event: 'update-request-body', value: LlmRequestBodyRecord | undefined): void;
 }>();
 
-const addPanelOpen = ref(false);
+const jsonScroller = ref<HTMLTextAreaElement | null>(null);
 const viewMode = ref<'parameter' | 'json'>('parameter');
 const jsonDraft = ref('{}');
 const jsonError = ref('');
 const editingJson = ref(false);
 
-const providerLabel = computed(() => labelForProvider(props.config.provider));
 const generationConfig = computed<LlmGenerationConfigRecord>(() => props.config.generationConfig ?? {});
 const requestBody = computed<LlmRequestBodyRecord>(() => props.config.requestBody ?? {});
 const capabilities = computed(() => resolveProviderModelCapabilities(props.config, props.config.model));
-const supportedDefinitions = computed(() => parameterDefinitionsForProvider(props.config.provider, props.config.model, capabilities.value));
-const definitions = computed(() => parameterDefinitionsForProvider(props.config.provider, props.config.model).map((definition) =>
-  supportedDefinitions.value.find((supported) => supported.key === definition.key) ?? {
-    ...definition, description: `${definition.description} 当前模型未确认支持；已保存值保留供检查或移除。`
-  }));
-const activeDefinitions = computed(() => definitions.value.filter((definition) => hasPath(generationConfig.value, definition.path)));
-const availableDefinitions = computed<LlmParameterAddOption[]>(() => supportedDefinitions.value.filter((definition) => !hasPath(generationConfig.value, definition.path)).map(withMutualExclusionState));
+const thinkingCapability = computed(() => sessionThinkingCapability(props.config.provider, props.config.model,
+  generationConfig.value.maxOutputTokens, generationConfig.value.thinkingConfig, props.config));
+const thinkingLabel = computed(() => sessionThinkingDisplayLabel(props.config.provider, props.config.model,
+  generationConfig.value.thinkingConfig, props.config));
+const supportedDefinitions = computed(() => {
+  const thinking = thinkingCapability.value;
+  const capability = capabilities.value;
+  return parameterDefinitionsForProvider(props.config.provider, props.config.model, capability).filter(definition => {
+    if (['temperature', 'topP', 'topK'].includes(definition.key)
+      && props.config.provider === 'claude' && anthropicRejectsNonDefaultSampling(props.config.model)) return false;
+    if (definition.path[0] !== 'thinkingConfig') return true;
+    if (props.config.provider === 'openai-compatible'
+      && resolveProviderOpenAICompatibleDialect(props.config, props.config.model).format === 'omit') return false;
+    if (thinking && 'min' in thinking && definition.key === 'thinkingLevel') {
+      return capability.reasoning.family === 'anthropic_extended'
+        && (capability.reasoning.levels.length > 0 || capability.reasoning.canDisable);
+    }
+    return Boolean(thinking) || capability.reasoning.family !== 'none' || capability.source === 'unknown';
+  }).map(definition => {
+    if (definition.key === 'maxOutputTokens') return { ...definition, label: '最大输出 Token' };
+    if (definition.key === 'thinkingBudget' && thinking && 'min' in thinking) {
+      return { ...definition, description: `预算范围 ${thinking.min}–${thinking.max} Token。${thinking.automatic !== undefined ? ` ${thinking.automatic} 使用自动预算。` : ''}${thinking.allowZero ? ' 0 关闭思考。' : ''}留空使用模型默认。` };
+    }
+    if (definition.key !== 'thinkingLevel' || !thinking || !('values' in thinking)) return definition;
+    return { ...definition, label: '思考强度', options: thinking.values
+      .filter(value => definition.options?.some(option => option.value === value))
+      .map(value => definition.options!.find(option => option.value === value)!) };
+  });
+});
+// Saved but no-longer-supported fields remain visible for removal; displaying an unset row never writes a value.
+const definitions = computed(() => {
+  const all = [...parameterDefinitionsForProvider(props.config.provider, props.config.model),
+    ...parameterDefinitionsForProvider(props.config.provider)];
+  const result = [...supportedDefinitions.value];
+  for (const definition of all) {
+    if (!result.some(item => item.key === definition.key) && hasPath(generationConfig.value, definition.path)) {
+      result.push({ ...definition, label: `${definition.label}（未确认支持）`, options: [], description: '当前模型未确认支持；已保存值保留供检查或清除。' });
+    }
+  }
+  const order = ['thinkingLevel', 'thinkingBudget', 'reasoningMode', 'maxOutputTokens', 'temperature', 'topP', 'topK', 'includeThoughts'];
+  return result.sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key));
+});
 const hasRequestBody = computed(() => Object.keys(requestBody.value).length > 0);
-const hasAnyParameter = computed(() => activeDefinitions.value.length > 0 || hasRequestBody.value);
 
 watch(
   () => props.config.requestBody,
@@ -51,14 +86,8 @@ watch(
   { deep: true, immediate: true }
 );
 
-function addKnownParameter(key: string): void {
-  const definition = definitions.value.find((candidate) => candidate.key === key);
-  if (!definition) return;
-  if (isThinkingMutuallyExcluded(definition)) return;
-  updateKnownValue(definition, definition.defaultValue);
-}
-
 function removeKnownParameter(definition: LlmParameterDefinition): void {
+  jsonError.value = '';
   const next = cloneGenerationConfig(generationConfig.value);
   deletePath(next, definition.path);
   emitGenerationConfig(next);
@@ -68,11 +97,30 @@ function updateKnownValue(definition: LlmParameterDefinition, value: unknown): v
   const next = cloneGenerationConfig(generationConfig.value);
   if (value === undefined || value === '') deletePath(next, definition.path);
   else setPath(next, definition.path, value);
-  if (next.thinkingConfig && capabilities.value.source !== 'unknown' && capabilities.value.reasoning.family !== 'none'
-    && capabilities.value.reasoning.family !== 'deepseek_toggle'
-    && !thinkingConfigSupported(next.thinkingConfig, capabilities.value.reasoning)) {
-    jsonError.value = '当前模型不支持该思考配置，请先移除冲突的预算或强度。';
-    return;
+  if (value !== undefined && value !== '') {
+    try {
+      const otherThinkingKey = definition.key === 'thinkingLevel' ? 'thinkingBudget'
+        : definition.key === 'thinkingBudget' ? 'thinkingLevel' : undefined;
+      if (otherThinkingKey && generationConfig.value.thinkingConfig?.[otherThinkingKey] !== undefined
+        && !(props.config.provider === 'claude' && capabilities.value.reasoning.family === 'anthropic_extended')) {
+        throw new Error('思考预算和强度只能保留一个，请先清除另一项。');
+      }
+      const thinking = thinkingCapability.value;
+      if (definition.key === 'thinkingLevel' && thinking && 'values' in thinking && !thinking.values.includes(value as LlmThinkingLevel)) {
+        throw new Error('当前模型不支持该思考强度。');
+      }
+      if (definition.key === 'thinkingBudget' && thinking && 'min' in thinking) {
+        validateSessionThinkingOverride({ kind: thinking.kind, tokens: value as number }, props.config.provider,
+          props.config.model, next, props.config.requestBody, props.config);
+      }
+      if (next.thinkingConfig && capabilities.value.source !== 'unknown' && capabilities.value.reasoning.family !== 'none'
+        && !thinkingConfigSupported(next.thinkingConfig, capabilities.value.reasoning)) {
+        throw new Error('当前模型不支持该思考配置，请先清除冲突的预算或强度。');
+      }
+    } catch (error) {
+      jsonError.value = error instanceof Error ? error.message : '参数无效';
+      return;
+    }
   }
   jsonError.value = '';
   emitGenerationConfig(next);
@@ -102,10 +150,16 @@ function onJsonInput(event: Event): void {
 }
 
 function onJsonBlur(): void {
-  editingJson.value = false;
   const parsed = parseRequestBodyJson(jsonDraft.value);
   if (!parsed.ok) return;
+  editingJson.value = false;
   jsonDraft.value = stringifyRequestBody(parsed.value);
+}
+
+function resetJsonDraft(): void {
+  editingJson.value = false;
+  jsonError.value = '';
+  jsonDraft.value = stringifyRequestBody(requestBody.value);
 }
 
 function formatJson(): void {
@@ -128,27 +182,6 @@ function clearJson(): void {
 
 function stringifyRequestBody(value: LlmRequestBodyRecord): string {
   return JSON.stringify(value ?? {}, null, 2);
-}
-
-function withMutualExclusionState(definition: LlmParameterDefinition): LlmParameterAddOption {
-  if (!isThinkingParameter(definition)) return definition;
-  const activeThinking = activeDefinitions.value.find((candidate) => isThinkingParameter(candidate));
-  if (!activeThinking || activeThinking.key === definition.key) return definition;
-  return {
-    ...definition,
-    disabled: true,
-    disabledReason: `${activeThinking.label} 已启用；思考预算和思考强度只能保留一个，请先移除 ${activeThinking.label}。`
-  };
-}
-
-function isThinkingMutuallyExcluded(definition: LlmParameterDefinition): boolean {
-  if (!isThinkingParameter(definition)) return false;
-  return activeDefinitions.value.some((candidate) => isThinkingParameter(candidate) && candidate.key !== definition.key);
-}
-
-function isThinkingParameter(definition: LlmParameterDefinition): boolean {
-  if (props.config.provider === 'claude' && capabilities.value.reasoning.family === 'anthropic_extended') return false;
-  return definition.key === 'thinkingBudget' || definition.key === 'thinkingLevel';
 }
 
 function parseRequestBodyJson(text: string): { ok: true; value: LlmRequestBodyRecord } | { ok: false; error: string } {
@@ -231,14 +264,21 @@ function uniqueKey(base: string, existingKeys: string[]): string {
 </script>
 
 <template>
-  <section class="llm-parameter-settings" aria-label="渠道参数配置">
+  <section v-if="section !== 'request-body'" class="llm-generation-settings" aria-label="生成参数">
+    <LlmKnownParameterRow v-for="definition in definitions" :key="definition.key"
+      :definition="definition" :model-value="getPathValue(generationConfig, definition.path)"
+      @update:model-value="updateKnownValue(definition, $event)" @remove="removeKnownParameter(definition)" />
+    <LlmSettingHint :text="`思考：${thinkingLabel}`" details="未设置时不发送覆盖参数，由模型决定；关闭会发送明确的关闭设置。未知兼容端点的手工参数未经验证。" />
+    <p v-if="jsonError" class="llm-json-error" role="alert">{{ jsonError }}</p>
+  </section>
+  <section v-else class="llm-parameter-settings" aria-label="自定义请求体">
     <header class="llm-parameter-header">
       <div>
-        <label>自定义请求参数</label>
-        <p>参数视图用于管理常用参数和自定义覆盖；JSON 视图可直接编辑底层请求体（requestBody）。</p>
+        <label>Request Body JSON</label>
+        <LlmSettingHint text="覆盖同名请求字段。" details="仅编辑底层 requestBody；常用生成参数在上方设置，不在此重复编辑。" />
       </div>
       <div class="llm-parameter-header-actions">
-        <button v-if="viewMode === 'parameter'" type="button" class="llm-parameter-add" @click="addPanelOpen = true">
+        <button v-if="viewMode === 'parameter'" type="button" class="llm-parameter-add" @click="addCustomRequestBodyParameter">
           <IconPlus stroke="2" aria-hidden="true" />
           <span>添加参数</span>
         </button>
@@ -250,21 +290,7 @@ function uniqueKey(base: string, existingKeys: string[]): string {
     </header>
 
     <div v-if="viewMode === 'parameter'" class="llm-parameter-list">
-      <div class="llm-parameter-list-meta">
-        <strong>{{ providerLabel }}</strong>
-        <span>自定义参数会写入底层请求体，并覆盖渠道自动生成的同名字段。</span>
-      </div>
-
-      <div v-if="!hasAnyParameter" class="llm-parameter-empty">暂无参数，点击“添加参数”选择。</div>
-
-      <LlmKnownParameterRow
-        v-for="definition in activeDefinitions"
-        :key="definition.key"
-        :definition="definition"
-        :model-value="getPathValue(generationConfig, definition.path)"
-        @update:model-value="updateKnownValue(definition, $event)"
-        @remove="removeKnownParameter(definition)"
-      />
+      <div v-if="!hasRequestBody" class="llm-parameter-empty">未设置自定义请求体。</div>
 
       <LlmCustomRequestBodyEditor v-if="hasRequestBody" :model-value="requestBody" @update:model-value="updateRequestBody" />
     </div>
@@ -276,11 +302,15 @@ function uniqueKey(base: string, existingKeys: string[]): string {
           <p>这里设置当前渠道额外发送的请求字段。它们会覆盖同名默认字段，但不包含消息、工具和系统提示词。</p>
         </div>
         <div class="llm-json-actions">
+          <button v-if="jsonError" type="button" @click="resetJsonDraft">恢复当前配置</button>
           <button type="button" @click="formatJson">格式化</button>
           <button type="button" @click="clearJson">清空</button>
         </div>
       </div>
+      <div class="llm-json-shell">
       <textarea
+        ref="jsonScroller"
+        aria-label="Request Body JSON"
         class="llm-json-editor"
         :class="{ invalid: !!jsonError }"
         :value="jsonDraft"
@@ -288,22 +318,20 @@ function uniqueKey(base: string, existingKeys: string[]): string {
         @input="onJsonInput"
         @blur="onJsonBlur"
       ></textarea>
+      <AdvancedScrollbar :scroller="jsonScroller" variant="minimal" />
+      </div>
       <p v-if="jsonError" class="llm-json-error">{{ jsonError }}</p>
       <p v-else class="llm-json-hint">JSON 有效时会保存到当前配置的底层请求体（requestBody）。</p>
     </div>
 
-    <LlmParameterAddPanel
-      :open="addPanelOpen"
-      :definitions="availableDefinitions"
-      :provider-label="providerLabel"
-      @add-known="addKnownParameter"
-      @add-custom="addCustomRequestBodyParameter"
-      @close="addPanelOpen = false"
-    />
   </section>
 </template>
 
 <style scoped>
+.llm-generation-settings { display: grid; gap: var(--space-1); min-width: 0; }
+.llm-json-shell { position: relative; }
+.llm-json-editor { scrollbar-width: none; }
+.llm-json-editor::-webkit-scrollbar { display: none; }
 .llm-parameter-settings {
   display: flex;
   flex-direction: column;
@@ -402,20 +430,6 @@ function uniqueKey(base: string, existingKeys: string[]): string {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-}
-
-.llm-parameter-list-meta {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--space-2);
-  color: var(--vscode-descriptionForeground);
-  font-size: var(--font-size-xs);
-}
-
-.llm-parameter-list-meta strong {
-  color: var(--vscode-descriptionForeground);
-  font-size: var(--font-size-sm);
 }
 
 .llm-parameter-empty {

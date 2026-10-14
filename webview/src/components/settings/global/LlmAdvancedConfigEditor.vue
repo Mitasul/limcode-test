@@ -18,7 +18,6 @@ import {
   type LlmPromptCacheTtl,
   type LlmProviderHeadersRecord,
   type LlmRequestBodyRecord,
-  type LlmToolCallFormat,
   type OpenAICompatibleThinkingFormat
 } from '@shared/protocol';
 import {
@@ -43,6 +42,7 @@ import { IconFlask } from '@tabler/icons-vue';
 import SettingsDropdown, { type SettingsDropdownOption } from './SettingsDropdown.vue';
 import LlmHeadersSettings from './parameters/LlmHeadersSettings.vue';
 import LlmParameterSettings from './parameters/LlmParameterSettings.vue';
+import LlmSettingHint from './parameters/LlmSettingHint.vue';
 
 const TOKEN_STEP = 1_000;
 
@@ -71,10 +71,6 @@ const emit = defineEmits<{
   /** 点了“测试这个模型”：由上层确认后测试 config.model。 */
   (event: 'test-thinking'): void;
 }>();
-
-const toolCallFormatOptions: SettingsDropdownOption[] = [
-  { value: 'function-call', label: 'Function Call' }
-];
 
 const THINKING_FORMATS: readonly OpenAICompatibleThinkingFormat[] = ['deepseek', 'enable_thinking', 'reasoning_effort', 'omit'];
 /** 自动识别按测试结果、接口地址和模型 ID 得出，这里直接把正在编辑的模型会得出的结果写在选项说明里。 */
@@ -225,10 +221,6 @@ function updateSystemPromptPrefix(event: Event): void {
   emit('update-field', { systemPromptPrefix: (event.target as HTMLTextAreaElement).value });
 }
 
-function updateToolCallFormat(value: string): void {
-  emit('update-field', { toolCallFormat: value as LlmToolCallFormat });
-}
-
 function updateOpenAIResponsesTransport(value: string): void {
   emit('update-field', { openaiResponsesTransport: (value === 'websocket' ? 'websocket' : 'http') as LlmOpenAIResponsesTransport });
 }
@@ -360,344 +352,365 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
 </script>
 
 <template>
-  <div class="global-settings-grid advanced-config-editor">
-    <label class="global-settings-field">
-      <span>工具调用格式</span>
-      <SettingsDropdown
-        :model-value="config.toolCallFormat"
-        :options="toolCallFormatOptions"
-        title="选择工具调用格式"
-        @update:model-value="updateToolCallFormat"
-      />
-      <span v-if="chatCompletionsToolHint" class="stream-checkbox-text chat-completions-tool-hint">{{ chatCompletionsToolHint }}</span>
-    </label>
+  <div class="advanced-config-editor">
+    <section class="config-section" aria-label="生成与上下文">
+      <h3>生成与上下文</h3>
+      <div class="global-settings-grid">
+        <label class="global-settings-field context-window-field">
+          <span>上下文容量（Token）</span>
+          <input
+            class="token-number-input"
+            :value="config.contextWindowTokens ?? ''"
+            type="number"
+            min="1000"
+            :step="TOKEN_STEP"
+            placeholder="未设置（使用模型容量）"
+            aria-label="上下文容量（Token）"
+            @change="updateContextWindowTokens"
+          />
+        </label>
 
-    <label v-if="config.provider === 'openai-responses'" class="global-settings-field openai-responses-transport-field">
-      <span>连接模式</span>
-      <SettingsDropdown
-        :model-value="config.openaiResponsesTransport ?? 'http'"
-        :options="openaiResponsesTransportOptions"
-        title="选择 OpenAI Responses 连接模式"
-        @update:model-value="updateOpenAIResponsesTransport"
-      />
-      <span class="stream-checkbox-text">WebSocket 模式不会在服务端保存对话；断线或重新加载后，会使用本地聊天记录恢复上下文。</span>
-    </label>
-
-    <label class="global-settings-field context-window-field">
-      <span>上下文窗口 Token 数</span>
-      <input
-        class="token-number-input"
-        :value="config.contextWindowTokens ?? ''"
-        type="number"
-        min="1000"
-        :step="TOKEN_STEP"
-        placeholder="例如 200000"
-        @change="updateContextWindowTokens"
-      />
-    </label>
-
-    <div class="global-settings-field stream-field">
-      <span>流式生成</span>
-      <div class="stream-checkbox-row">
-        <LcCheckbox
-          :model-value="config.stream !== false"
-          size="sm"
-          aria-label="启用流式生成"
-          @update:model-value="emit('update-field', { stream: $event })"
-        >
-          <span class="stream-checkbox-enable">启用</span>
-        </LcCheckbox>
-      </div>
-      <span class="stream-checkbox-text">启用流式生成。普通回复和上下文压缩会复用此配置。</span>
-    </div>
-
-    <div class="global-settings-field stream-field">
-      <span>多模态工具</span>
-      <div class="stream-checkbox-row">
-        <LcCheckbox
-          :model-value="config.enableMultimodalTools !== false"
-          size="sm"
-          aria-label="启用多模态工具"
-          @update:model-value="emit('update-field', { enableMultimodalTools: $event })"
-        >
-          <span class="stream-checkbox-enable">启用</span>
-        </LcCheckbox>
-      </div>
-      <span class="stream-checkbox-text">启用后 read 可返回图片、PDF 等附件内容；关闭后 read 只读取文本。</span>
-    </div>
-
-    <div class="global-settings-field stream-field prompt-cache-field">
-      <span>提示词缓存</span>
-      <div class="stream-checkbox-row">
-        <LcCheckbox
-          :model-value="promptCache.enabled && promptCacheSupported"
-          :disabled="!promptCacheSupported"
-          size="sm"
-          aria-label="启用提示词缓存"
-          @update:model-value="updatePromptCacheEnabled"
-        >
-          <span class="stream-checkbox-enable">启用提示词缓存</span>
-        </LcCheckbox>
-      </div>
-      <span class="stream-checkbox-text">{{ promptCacheDescription }}</span>
-    </div>
-
-    <label v-if="config.provider === 'openai-responses'" class="global-settings-field prompt-cache-mode-field">
-      <span>缓存模式</span>
-      <SettingsDropdown
-        :model-value="promptCache.mode"
-        :options="promptCacheModeOptions"
-        :disabled="!promptCacheSupported || !promptCache.enabled"
-        title="选择 OpenAI Responses 提示词缓存模式"
-        @update:model-value="updatePromptCacheMode"
-      />
-    </label>
-
-    <label v-if="config.provider === 'claude'" class="global-settings-field prompt-cache-ttl-field">
-      <span>缓存时间</span>
-      <SettingsDropdown
-        :model-value="promptCache.ttl"
-        :options="promptCacheTtlOptions"
-        :disabled="!promptCacheSupported || !promptCache.enabled"
-        title="选择提示词缓存时间"
-        @update:model-value="updatePromptCacheTtl"
-      />
-    </label>
-
-    <div v-if="config.provider === 'claude'" class="global-settings-field stream-field claude-turn-scoped-reminders-field">
-      <span>轮内系统消息提醒</span>
-      <div class="stream-checkbox-row">
-        <LcCheckbox
-          :model-value="config.claudeTurnScopedReminders === true"
-          size="sm"
-          aria-label="每轮提醒改用轮内系统消息"
-          @update:model-value="emit('update-field', { claudeTurnScopedReminders: $event })"
-        >
-          <span class="stream-checkbox-enable">启用</span>
-        </LcCheckbox>
-      </div>
-      <span class="stream-checkbox-text">把每轮提醒改为官方轮内系统消息，保持历史前缀不变，提升缓存命中并保留思考；需要模型与渠道支持轮内系统消息，扩展会自动带上所需 beta 头。渠道明确拒绝时自动退回原来的提醒方式。对话进行到一半时打开或关闭，下一次请求的缓存会失效一次，之前的提醒不会被补进历史。</span>
-    </div>
-
-    <div v-if="config.provider === 'openai-compatible'" class="global-settings-field global-settings-field-wide openai-compatible-thinking-format-field">
-      <span>思考参数写法</span>
-      <SettingsDropdown
-        :model-value="config.openaiCompatibleThinkingFormat ?? 'auto'"
-        :options="thinkingFormatOptions"
-        title="选择思考参数的发送写法"
-        @update:model-value="updateThinkingFormat"
-      />
-      <span class="stream-checkbox-text">当前发送（{{ config.model }}）：{{ thinkingFormatSummary }}。依次看手动指定、测试结果、接口地址和模型 ID；只有识别不对（例如中转站改了模型名）时才需要手动指定。</span>
-      <div class="thinking-probe-row">
-        <button
-          type="button"
-          class="model-manager-button thinking-probe-button"
-          :disabled="thinkingProbeRunning || !config.model"
-          @click="emit('test-thinking')"
-        >
-          <IconFlask stroke="2" aria-hidden="true" />
-          <span>{{ thinkingProbeRunning ? '测试中…' : '测试这个模型' }}</span>
-        </button>
-        <span class="stream-checkbox-text thinking-probe-text" :class="{ 'is-failed': thinkingProbe?.status === 'failed' }">{{ thinkingProbeText }}</span>
-      </div>
-    </div>
-
-    <template v-if="config.provider === 'openai-responses'">
-      <div class="global-settings-field global-settings-field-wide native-capabilities-field">
-        <span class="native-capabilities-heading">
-          <span>GPT-6 原生能力</span>
-          <HoverTooltipPanel
-            panel-title="原生能力状态"
-            :rows="nativeCapabilityRows"
-            :delay-ms="180"
-          >
-            <button type="button" class="native-capability-badge" :class="{ 'is-active': nativeGateAvailable }">
-              {{ nativeCapabilityStateText }}
-            </button>
-          </HoverTooltipPanel>
-        </span>
-        <span class="stream-checkbox-text">{{ nativeGateHint }}</span>
-      </div>
-
-      <label class="global-settings-field native-enabled-state-field">
-        <span>原生能力支持</span>
-        <SettingsDropdown
-          :model-value="nativeEnabledState"
-          :options="nativeEnabledStateOptions"
-          :disabled="!nativeModelSupported"
-          title="选择 GPT-6 原生能力支持方式"
-          @update:model-value="updateNativeEnabledState"
+        <LlmParameterSettings
+          class="global-settings-field-wide"
+          :config="config"
+          @update-generation-config="emit('update-generation-config', $event)"
         />
-        <span class="stream-checkbox-text">第三方中继选择「确认支持并启用」，即确认该中继支持 GPT-6（Astra、Sol、Luna）原生能力。</span>
-      </label>
 
-      <div class="global-settings-field stream-field">
-        <span>原生异步工具</span>
-        <div class="stream-checkbox-row">
-          <LcCheckbox
-            :model-value="nativeCapabilities.asyncTools"
-            :disabled="!nativeGateAvailable"
-            size="sm"
-            aria-label="启用原生异步工具"
-            @update:model-value="updateNativeFlag('asyncTools', $event)"
-          >
-            <span class="stream-checkbox-enable">启用</span>
-          </LcCheckbox>
+        <div class="global-settings-field stream-field">
+          <span>流式生成</span>
+          <div class="stream-checkbox-row">
+            <LcCheckbox
+              :model-value="config.stream !== false"
+              size="sm"
+              aria-label="启用流式生成"
+              @update:model-value="emit('update-field', { stream: $event })"
+            >
+              <span class="stream-checkbox-enable">启用</span>
+            </LcCheckbox>
+          </div>
+          <span class="stream-checkbox-text">普通回复与压缩共用。</span>
         </div>
-        <span class="stream-checkbox-text">在工具策略中单独标记「原生异步」的工具可以异步执行，结果稍后按原始调用 ID 回传；不改变执行审批、文件审批与调度方式。</span>
-      </div>
 
-      <div class="global-settings-field stream-field">
-        <span>回合内转向</span>
-        <div class="stream-checkbox-row">
-          <LcCheckbox
-            :model-value="nativeCapabilities.steering"
-            :disabled="!nativeGateAvailable || !nativeWebsocketTransport"
-            size="sm"
-            aria-label="启用回合内转向"
-            @update:model-value="updateNativeFlag('steering', $event)"
-          >
-            <span class="stream-checkbox-enable">启用</span>
-          </LcCheckbox>
+        <div class="global-settings-field stream-field">
+          <span>多模态工具</span>
+          <div class="stream-checkbox-row">
+            <LcCheckbox
+              :model-value="config.enableMultimodalTools !== false"
+              size="sm"
+              aria-label="启用多模态工具"
+              @update:model-value="emit('update-field', { enableMultimodalTools: $event })"
+            >
+              <span class="stream-checkbox-enable">启用</span>
+            </LcCheckbox>
+          </div>
+          <span class="stream-checkbox-text">read 可返回图片和 PDF；关闭后只读文本。</span>
         </div>
-        <span class="stream-checkbox-text">回复进行中可把新消息立即注入当前原生请求，被接受的输入会产生后续响应；需要 WebSocket 连接模式。转向回执中的「已发送 / 已接受」不代表内容已生效。</span>
-      </div>
 
-      <div class="global-settings-field stream-field">
-        <span>动态推理更新</span>
-        <div class="stream-checkbox-row">
-          <LcCheckbox
-            :model-value="nativeCapabilities.reasoningUpdates"
-            :disabled="!nativeGateAvailable || nativeReasoningUpdatesBlockedByPro"
-            size="sm"
-            aria-label="启用动态推理更新"
-            @update:model-value="updateNativeFlag('reasoningUpdates', $event)"
-          >
-            <span class="stream-checkbox-enable">启用</span>
-          </LcCheckbox>
+        <label v-if="config.provider === 'openai-responses'" class="global-settings-field openai-responses-transport-field">
+          <span>连接模式</span>
+          <SettingsDropdown
+            :model-value="config.openaiResponsesTransport ?? 'http'"
+            :options="openaiResponsesTransportOptions"
+            title="选择 OpenAI Responses 连接模式"
+            @update:model-value="updateOpenAIResponsesTransport"
+          />
+          <LlmSettingHint text="WebSocket 使用增量上下文。" details="WebSocket 模式不会在服务端保存对话；断线或重新加载后，会使用本地聊天记录恢复上下文。" />
+        </label>
+
+        <template v-if="nativeModelSupported">
+          <div class="global-settings-field global-settings-field-wide native-capabilities-field">
+            <span class="native-capabilities-heading">
+              <span>GPT-6 原生能力</span>
+              <HoverTooltipPanel
+                panel-title="原生能力状态"
+                :rows="nativeCapabilityRows"
+                :delay-ms="180"
+              >
+                <button type="button" class="native-capability-badge" :class="{ 'is-active': nativeGateAvailable }">
+                  {{ nativeCapabilityStateText }}
+                </button>
+              </HoverTooltipPanel>
+            </span>
+            <LlmSettingHint text="按模型与渠道确认原生能力。" :details="nativeGateHint" />
+          </div>
+
+          <label class="global-settings-field native-enabled-state-field">
+            <span>原生能力支持</span>
+            <SettingsDropdown
+              :model-value="nativeEnabledState"
+              :options="nativeEnabledStateOptions"
+              :disabled="!nativeModelSupported"
+              title="选择 GPT-6 原生能力支持方式"
+              @update:model-value="updateNativeEnabledState"
+            />
+            <LlmSettingHint text="第三方中继需要明确确认支持。" details="第三方中继选择「确认支持并启用」，即确认该中继支持 GPT-6（Astra、Sol、Luna）原生能力。" />
+          </label>
+
+          <div class="global-settings-field stream-field">
+            <span>原生异步工具</span>
+            <div class="stream-checkbox-row">
+              <LcCheckbox
+                :model-value="nativeCapabilities.asyncTools"
+                :disabled="!nativeGateAvailable"
+                size="sm"
+                aria-label="启用原生异步工具"
+                @update:model-value="updateNativeFlag('asyncTools', $event)"
+              >
+                <span class="stream-checkbox-enable">启用</span>
+              </LcCheckbox>
+            </div>
+            <LlmSettingHint text="仅对工具策略中标记的工具生效。" details="在工具策略中单独标记「原生异步」的工具可以异步执行，结果稍后按原始调用 ID 回传；不改变执行审批、文件审批与调度方式。" />
+          </div>
+
+          <div class="global-settings-field stream-field">
+            <span>回合内转向</span>
+            <div class="stream-checkbox-row">
+              <LcCheckbox
+                :model-value="nativeCapabilities.steering"
+                :disabled="!nativeGateAvailable || !nativeWebsocketTransport"
+                size="sm"
+                aria-label="启用回合内转向"
+                @update:model-value="updateNativeFlag('steering', $event)"
+              >
+                <span class="stream-checkbox-enable">启用</span>
+              </LcCheckbox>
+            </div>
+            <LlmSettingHint text="回复中接收新输入；需 WebSocket。" details="回复进行中可把新消息立即注入当前原生请求，被接受的输入会产生后续响应；需要 WebSocket 连接模式。转向回执中的「已发送 / 已接受」不代表内容已生效。" />
+          </div>
+
+          <div class="global-settings-field stream-field">
+            <span>动态推理更新</span>
+            <div class="stream-checkbox-row">
+              <LcCheckbox
+                :model-value="nativeCapabilities.reasoningUpdates"
+                :disabled="!nativeGateAvailable || nativeReasoningUpdatesBlockedByPro"
+                size="sm"
+                aria-label="启用动态推理更新"
+                @update:model-value="updateNativeFlag('reasoningUpdates', $event)"
+              >
+                <span class="stream-checkbox-enable">启用</span>
+              </LcCheckbox>
+            </div>
+            <LlmSettingHint text="在两个响应之间调整推理档位。" details="允许在两个响应之间调整推理档位。Limcode 的本地上下文压缩与动态推理兼容：压缩请求不携带推理更新，压缩完成后自动恢复当前档位（缓存会重置并可观察）；与服务端自动压缩不兼容的机制 Limcode 不使用。" />
+            <span v-if="nativeReasoningUpdatesBlockedByPro" class="stream-checkbox-text">推理模式为 pro 时不可用：官方只在标准推理模式（standard）下支持动态推理更新。</span>
+          </div>
+
+          <div class="global-settings-field stream-field">
+            <span>WebSocket 多路复用</span>
+            <div class="stream-checkbox-row">
+              <LcCheckbox
+                :model-value="nativeCapabilities.multiplexing"
+                :disabled="!nativeGateAvailable || !nativeWebsocketTransport"
+                size="sm"
+                aria-label="启用 WebSocket 多路复用"
+                @update:model-value="updateNativeFlag('multiplexing', $event)"
+              >
+                <span class="stream-checkbox-enable">启用</span>
+              </LcCheckbox>
+            </div>
+            <LlmSettingHint text="多个对话共用连接；需 WebSocket。" details="多个对话以命名通道复用同一 WebSocket 物理连接；需要 WebSocket 连接模式。物理连接断开会使所有通道的缓存失效。" />
+          </div>
+
+        </template>
+
+          </div>
+          <LlmSettingHint v-if="chatCompletionsToolHint" text="当前 Chat Completions 模型有工具限制。" :details="chatCompletionsToolHint" />
+        </section>
+        <section class="config-section" aria-label="重试">
+          <h3>重试</h3>
+          <div class="global-settings-grid retry-settings-grid">
+        <div class="global-settings-field stream-field retry-field">
+          <span>报错自动重试</span>
+          <div class="stream-checkbox-row">
+            <LcCheckbox
+              :model-value="config.retryOnError ?? DEFAULT_LLM_RETRY_ON_ERROR"
+              size="sm"
+              aria-label="启用报错自动重试"
+              @update:model-value="emit('update-field', { retryOnError: $event })"
+            >
+              <span class="stream-checkbox-enable">启用</span>
+            </LcCheckbox>
+          </div>
+          <LlmSettingHint text="重试可恢复的模型请求错误。" details="对可恢复的模型请求错误自动重试，默认 8 次，最多 10 次（不包含原始请求）；0 关闭自动重试。默认遇到鉴权、额度或请求参数错误时停止；开启下方强制重试后也会重试这些错误。不会盲目重放结果不明的外部工具操作。设置在后续回合生效。" />
         </div>
-        <span class="stream-checkbox-text">允许在两个响应之间调整推理档位。Limcode 的本地上下文压缩与动态推理兼容：压缩请求不携带推理更新，压缩完成后自动恢复当前档位（缓存会重置并可观察）；与服务端自动压缩不兼容的机制 Limcode 不使用。</span>
-        <span v-if="nativeReasoningUpdatesBlockedByPro" class="stream-checkbox-text">推理模式为 pro 时不可用：官方只在标准推理模式（standard）下支持动态推理更新。</span>
-      </div>
 
-      <div class="global-settings-field stream-field">
-        <span>WebSocket 多路复用</span>
-        <div class="stream-checkbox-row">
-          <LcCheckbox
-            :model-value="nativeCapabilities.multiplexing"
-            :disabled="!nativeGateAvailable || !nativeWebsocketTransport"
-            size="sm"
-            aria-label="启用 WebSocket 多路复用"
-            @update:model-value="updateNativeFlag('multiplexing', $event)"
-          >
-            <span class="stream-checkbox-enable">启用</span>
-          </LcCheckbox>
+        <div class="global-settings-field stream-field retry-field">
+          <span>强制重试</span>
+          <div class="stream-checkbox-row">
+            <LcCheckbox
+              :model-value="config.retryForceAllErrors === true"
+              :disabled="!(config.retryOnError ?? DEFAULT_LLM_RETRY_ON_ERROR) || normalizeRetryMaxAttempts(config.retryMaxAttempts) === 0"
+              size="sm"
+              aria-label="无视供应商错误类型强制重试"
+              @update:model-value="emit('update-field', { retryForceAllErrors: $event })"
+            >
+              <span class="stream-checkbox-enable">启用</span>
+            </LcCheckbox>
+          </div>
+          <LlmSettingHint text="包括鉴权、额度和参数错误；可能增加费用。" details="包括鉴权失败、额度不足、请求参数等供应商错误，仍按设定次数和间隔重试，可能产生额外费用。停止操作始终有效；本地错误不重发模型请求，已完成工具不重复执行，上下文超限仍走压缩修复。" />
         </div>
-        <span class="stream-checkbox-text">多个对话以命名通道复用同一 WebSocket 物理连接；需要 WebSocket 连接模式。物理连接断开会使所有通道的缓存失效。</span>
+
+        <label class="global-settings-field retry-attempts-field">
+          <span>最大重试次数</span>
+          <LlmSettingHint text="0 关闭；最多 10 次，不含首次请求。" />
+          <input
+            class="token-number-input"
+            aria-label="最大重试次数"
+            :value="normalizeRetryMaxAttempts(config.retryMaxAttempts)"
+            type="number"
+            min="0"
+            :max="MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS"
+            step="1"
+            :placeholder="String(DEFAULT_LLM_RETRY_MAX_ATTEMPTS)"
+            @change="updateRetryMaxAttempts"
+          />
+        </label>
+
+        <label class="global-settings-field">
+          <span>重试间隔（秒）</span>
+          <LlmSettingHint text="0 使用自动退避。" details="正数为固定等待秒数；服务端 Retry-After 仍是最早重试时间，不会提前发送。" />
+          <input
+            class="token-number-input"
+            aria-label="重试间隔（秒）"
+            :value="config.retryDelaySeconds ?? DEFAULT_LLM_RETRY_DELAY_SECONDS"
+            type="number"
+            min="0"
+            :max="MAX_LLM_RETRY_DELAY_SECONDS"
+            step="1"
+            placeholder="0"
+            @change="updateRetryDelaySeconds"
+          />
+        </label>
+
       </div>
+    </section>
+    <section v-if="promptCacheSupported || $slots.compression" class="config-section" aria-label="缓存与压缩">
+      <h3>缓存与压缩</h3>
+      <div v-if="promptCacheSupported" class="global-settings-grid">
+        <div v-if="promptCacheSupported" class="global-settings-field stream-field prompt-cache-field">
+          <span>提示词缓存</span>
+          <div class="stream-checkbox-row">
+            <LcCheckbox
+              :model-value="promptCache.enabled && promptCacheSupported"
+              :disabled="!promptCacheSupported"
+              size="sm"
+              aria-label="启用提示词缓存"
+              @update:model-value="updatePromptCacheEnabled"
+            >
+              <span class="stream-checkbox-enable">启用提示词缓存</span>
+            </LcCheckbox>
+          </div>
+          <LlmSettingHint :text="config.provider === 'openai-responses' && promptCache.mode === 'explicit' ? '显式缓存 TTL 固定为 30 分钟。' : '复用相同输入前缀。'" :details="promptCacheDescription" />
+        </div>
 
-      <div v-if="nativeCapabilities.explicitCaching" class="global-settings-field stream-field native-explicit-cache-field">
-        <span>显式缓存</span>
-        <span class="stream-checkbox-text">GPT-6 原生连接保留显式缓存参数：prompt_cache_options（30 分钟 TTL）与内容缓存断点不会被剥离；本地上下文压缩后缓存重置，并随后续请求重建。在上方「提示词缓存」中选择缓存模式。</span>
+        <label v-if="config.provider === 'openai-responses'" class="global-settings-field prompt-cache-mode-field">
+          <span>缓存模式</span>
+          <SettingsDropdown
+            :model-value="promptCache.mode"
+            :options="promptCacheModeOptions"
+            :disabled="!promptCacheSupported || !promptCache.enabled"
+            title="选择 OpenAI Responses 提示词缓存模式"
+            @update:model-value="updatePromptCacheMode"
+          />
+        </label>
+
+        <label v-if="config.provider === 'claude'" class="global-settings-field prompt-cache-ttl-field">
+          <span>缓存时间</span>
+          <SettingsDropdown
+            :model-value="promptCache.ttl"
+            :options="promptCacheTtlOptions"
+            :disabled="!promptCacheSupported || !promptCache.enabled"
+            title="选择提示词缓存时间"
+            @update:model-value="updatePromptCacheTtl"
+          />
+        </label>
+
+        <div v-if="config.provider === 'claude'" class="global-settings-field stream-field claude-turn-scoped-reminders-field">
+          <span>轮内系统消息提醒</span>
+          <div class="stream-checkbox-row">
+            <LcCheckbox
+              :model-value="config.claudeTurnScopedReminders === true"
+              size="sm"
+              aria-label="每轮提醒改用轮内系统消息"
+              @update:model-value="emit('update-field', { claudeTurnScopedReminders: $event })"
+            >
+              <span class="stream-checkbox-enable">启用</span>
+            </LcCheckbox>
+          </div>
+          <LlmSettingHint text="保持历史前缀，需渠道支持。" details="把每轮提醒改为官方轮内系统消息，保持历史前缀不变，提升缓存命中并保留思考；需要模型与渠道支持轮内系统消息，扩展会自动带上所需 beta 头。渠道明确拒绝时自动退回原来的提醒方式。对话进行到一半时打开或关闭，下一次请求的缓存会失效一次，之前的提醒不会被补进历史。" />
+        </div>
+
       </div>
-    </template>
+      <slot name="compression" />
+    </section>
+    <details class="config-section advanced-request-settings">
+      <summary>高级请求定制</summary>
+      <div class="global-settings-grid">
+        <div v-if="config.provider === 'openai-compatible'" class="global-settings-field global-settings-field-wide openai-compatible-thinking-format-field">
+          <span>思考参数写法</span>
+          <SettingsDropdown
+            :model-value="config.openaiCompatibleThinkingFormat ?? 'auto'"
+            :options="thinkingFormatOptions"
+            title="选择思考参数的发送写法"
+            @update:model-value="updateThinkingFormat"
+          />
+          <span class="stream-checkbox-text">当前发送（{{ config.model }}）：{{ thinkingFormatSummary }}。依次看手动指定、测试结果、接口地址和模型 ID；只有识别不对（例如中转站改了模型名）时才需要手动指定。</span>
+          <div class="thinking-probe-row">
+            <button
+              type="button"
+              class="model-manager-button thinking-probe-button"
+              :disabled="thinkingProbeRunning || !config.model"
+              @click="emit('test-thinking')"
+            >
+              <IconFlask stroke="2" aria-hidden="true" />
+              <span>{{ thinkingProbeRunning ? '测试中…' : '测试这个模型' }}</span>
+            </button>
+            <span class="stream-checkbox-text thinking-probe-text" :class="{ 'is-failed': thinkingProbe?.status === 'failed' }">{{ thinkingProbeText }}</span>
+          </div>
+        </div>
 
-    <div class="global-settings-field stream-field retry-field">
-      <span>报错自动重试</span>
-      <div class="stream-checkbox-row">
-        <LcCheckbox
-          :model-value="config.retryOnError ?? DEFAULT_LLM_RETRY_ON_ERROR"
-          size="sm"
-          aria-label="启用报错自动重试"
-          @update:model-value="emit('update-field', { retryOnError: $event })"
-        >
-          <span class="stream-checkbox-enable">启用</span>
-        </LcCheckbox>
+        <label class="global-settings-field global-settings-field-wide system-prompt-prefix-field">
+          <span>前置系统提示词</span>
+          <span class="global-settings-field-hint">不添加标题；非空内容会放在最终系统提示词的最前面，并与后面的内容空一行。</span>
+          <div class="system-prompt-prefix-shell">
+            <textarea
+              ref="systemPromptPrefixScroller"
+              :value="config.systemPromptPrefix"
+              rows="5"
+              aria-label="前置系统提示词"
+              placeholder="默认为空；填写仅供当前渠道或 LLM 使用的额外要求…"
+              spellcheck="false"
+              @input="updateSystemPromptPrefix"
+            ></textarea>
+            <AdvancedScrollbar :scroller="systemPromptPrefixScroller" variant="minimal" />
+          </div>
+        </label>
+
+        <LlmParameterSettings
+          class="global-settings-field-wide"
+          :config="config"
+          section="request-body"
+          @update-request-body="emit('update-request-body', $event)"
+        />
+
+        <LlmHeadersSettings
+          class="global-settings-field-wide"
+          :model-value="config.headers ?? {}"
+          @update:model-value="emit('update-headers', $event)"
+        />
       </div>
-      <span class="stream-checkbox-text">对可恢复的模型请求错误自动重试，默认 8 次，最多 10 次（不包含原始请求）；0 关闭自动重试。默认遇到鉴权、额度或请求参数错误时停止；开启下方强制重试后也会重试这些错误。不会盲目重放结果不明的外部工具操作。设置在后续回合生效。</span>
-    </div>
-
-    <div class="global-settings-field stream-field retry-field">
-      <span>强制重试</span>
-      <div class="stream-checkbox-row">
-        <LcCheckbox
-          :model-value="config.retryForceAllErrors === true"
-          :disabled="!config.retryOnError || normalizeRetryMaxAttempts(config.retryMaxAttempts) === 0"
-          size="sm"
-          aria-label="无视供应商错误类型强制重试"
-          @update:model-value="emit('update-field', { retryForceAllErrors: $event })"
-        >
-          <span class="stream-checkbox-enable">启用</span>
-        </LcCheckbox>
-      </div>
-      <span class="stream-checkbox-text">包括鉴权失败、额度不足、请求参数等供应商错误，仍按设定次数和间隔重试，可能产生额外费用。停止操作始终有效；本地错误不重发模型请求，已完成工具不重复执行，上下文超限仍走压缩修复。</span>
-    </div>
-
-    <label class="global-settings-field retry-attempts-field">
-      <span>最大重试次数</span>
-      <input
-        class="token-number-input"
-        :value="normalizeRetryMaxAttempts(config.retryMaxAttempts)"
-        type="number"
-        min="0"
-        :max="MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS"
-        step="1"
-        :placeholder="String(DEFAULT_LLM_RETRY_MAX_ATTEMPTS)"
-        @change="updateRetryMaxAttempts"
-      />
-    </label>
-
-    <label class="global-settings-field">
-      <span>重试间隔（秒）</span>
-      <span class="global-settings-field-hint">每次重试前固定等待的秒数，用来避开 TPM 限流；填 0 表示沿用自动退避（0.5 秒起指数递增，最长 8 秒）。</span>
-      <input
-        class="token-number-input"
-        :value="config.retryDelaySeconds ?? DEFAULT_LLM_RETRY_DELAY_SECONDS"
-        type="number"
-        min="0"
-        :max="MAX_LLM_RETRY_DELAY_SECONDS"
-        step="1"
-        placeholder="0"
-        @change="updateRetryDelaySeconds"
-      />
-    </label>
-
-    <label class="global-settings-field global-settings-field-wide system-prompt-prefix-field">
-      <span>前置系统提示词</span>
-      <span class="global-settings-field-hint">不添加标题；非空内容会放在最终系统提示词的最前面，并与后面的内容空一行。</span>
-      <div class="system-prompt-prefix-shell">
-        <textarea
-          ref="systemPromptPrefixScroller"
-          :value="config.systemPromptPrefix"
-          rows="5"
-          aria-label="前置系统提示词"
-          placeholder="默认为空；填写仅供当前渠道或 LLM 使用的额外要求…"
-          spellcheck="false"
-          @input="updateSystemPromptPrefix"
-        ></textarea>
-        <AdvancedScrollbar :scroller="systemPromptPrefixScroller" variant="minimal" />
-      </div>
-    </label>
-
-    <LlmParameterSettings
-      class="global-settings-field-wide"
-      :config="config"
-      @update-generation-config="emit('update-generation-config', $event)"
-      @update-request-body="emit('update-request-body', $event)"
-    />
-
-    <LlmHeadersSettings
-      class="global-settings-field-wide"
-      :model-value="config.headers ?? {}"
-      @update:model-value="emit('update-headers', $event)"
-    />
+    </details>
   </div>
 </template>
 
 <style scoped>
-.advanced-config-editor {
-  margin: 0;
-}
+.advanced-config-editor { display: grid; gap: var(--space-4); margin: 0; }
+.config-section { min-width: 0; display: grid; gap: var(--space-2); border-top: 1px solid var(--vscode-panel-border); padding-top: var(--space-3); }
+.config-section h3, .config-section summary { margin: 0; font-size: var(--font-size-sm); font-weight: 600; }
+.config-section summary { cursor: pointer; }
+.config-section > .global-settings-grid { margin: 0; }
+.advanced-request-settings[open] > .global-settings-grid { margin-top: var(--space-3); }
+.retry-settings-grid { align-items: start; }
 
 .stream-field {
   justify-content: start;

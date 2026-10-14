@@ -85,7 +85,7 @@ test('丢失ACK后生产store核对磁盘并提交最新排队草稿，旧ACK不
 });
 
 test('实际prompt编辑器的早期草稿与保存后新编辑都不会被旧快照擦掉', async t => {
-  const f = graph.session(t), { view } = f.mount('Prompt', { scopeKind: 'conversation', scopeId: 'prompt' });
+  const f = graph.session(t), mounted = f.mount('Prompt', { scopeKind: 'conversation', scopeId: 'prompt' }), { view } = mounted;
   f.client.configurationReady = false;
   view.draft = 'typed before load';
   f.client.systemPrompts = [{ id: 'prompt-record', name: 'smoke', text: 'saved prompt' }];
@@ -96,10 +96,14 @@ test('实际prompt编辑器的早期草稿与保存后新编辑都不会被旧�
   view.inheritMode = false;
   view.save(); const request = f.messages.at(-1);
   view.draft = 'newer local draft';
+  await mounted.setProps({ scopeId: 'other-prompt' });
+  view.draft = 'other object draft';
   f.client.systemPrompts[0].text = 'typed before load';
   f.client.systemPromptScopeLinks[0].updatedAt = 2;
   f.prompts.reconcilePendingSave(request.id);
   await graph.vue.nextTick();
+  assert.equal(view.draft, 'other object draft');
+  await mounted.setProps({ scopeId: 'prompt' });
   assert.equal(view.draft, 'newer local draft');
   view.draftState.reset();
   assert.equal(view.draft, 'typed before load');
@@ -128,7 +132,7 @@ function ackThinking(f, write, sequence, value) {
 test('真实model编辑器的排队Save只接受自己的ACK，thinking控件写显式继承值', async t => {
   const f = graph.session(t);
   f.global.llmProviderConfigs.configs = [{ id: 'provider', name: 'smoke', provider: 'openai-compatible', model: 'A', models: [{ id: 'A', name: 'A' }, { id: 'B', name: 'B' }] }];
-  const { view } = f.mount('Model', { scopeKind: 'agent', scopeId: 'agent' });
+  const mounted = f.mount('Model', { scopeKind: 'agent', scopeId: 'agent' }), { view } = mounted;
   const read = f.last(T.ModelProfileScopeRead);
   const profile = { id: 'profile', name: 'Model', providerConfigId: 'provider', provider: 'openai-compatible', model: 'A' };
   const base = { scopeKind: 'agent', scopeId: 'agent', authorityId: 'authority', sessionId: 'session', profileState: 'default',
@@ -146,6 +150,29 @@ test('真实model编辑器的排队Save只接受自己的ACK，thinking控件写
   assert.equal(view.draftState.dirty.value, true);
   ack(second, 3); await graph.vue.nextTick();
   assert.equal(view.draftState.dirty.value, false);
+  view.model = 'B'; view.save();
+  view.model = 'C'; view.discardDraft();
+  const discardRead = f.last(T.ModelProfileScopeRead);
+  await mounted.setProps({ scopeId: 'other-agent' });
+  view.model = 'other draft';
+  f.models.applyScopeSnapshot({ ...base, profile: { ...profile, model: 'B' },
+    sequence: 4, revision: '4', outcome: 'observed', afterRequestId: discardRead.payload.afterRequestId }, discardRead.id);
+  assert.equal(f.models.pendingFor('agent', 'agent'), undefined);
+  assert.equal(view.model, 'other draft', '原对象的丢弃读取不能改当前对象');
+  await mounted.setProps({ scopeId: 'agent' });
+  assert.equal(view.model, 'B', '回到原对象不能恢复已放弃的C');
+  assert.equal(view.draftState.dirty.value, false);
+  const staleReset = view.draftState.prepareReset();
+  view.model = 'C';
+  await mounted.setProps({ scopeId: 'other-agent' });
+  staleReset();
+  await mounted.setProps({ scopeId: 'agent' });
+  assert.equal(view.model, 'C', '原scope在读取后新编辑的缓存仍需保留');
+  view.draftState.reset();
+  view.providerConfigId = '__inherit_global_model__';
+  assert.equal(f.messagesOf(T.ModelProfileScopeClear).length, 0, '继承选择和普通选择一样只修改草稿');
+  view.save();
+  assert.equal(f.last(T.ModelProfileScopeClear).payload.scopeId, 'agent');
   const release = activate(f, 'thinking', 'high'); t.after(release);
   const thinking = f.mount('Thinking', { conversationId: 'thinking', model: 'o3', config: {
     id: 'provider', provider: 'openai-compatible', model: 'o3', modelConfigs: [] } }).view;
@@ -262,6 +289,18 @@ test('实际工具编辑器只保存本层授权与MCP原名，未复制上层�
   const frozen = JSON.parse((await authority.compile({ conversationId: 'tools', turnId: 'tools-turn', executorAgentId: 'main', intentKind: 'input' })).authoritySnapshot.content);
   assert.equal(frozen.toolPolicy.toolConfigs.run_agent.config.maxChildAgentDepth, 2);
   assert.equal(compiled('shared/toolPolicyResolution.js').toolAllowedByPolicy(frozen.toolPolicy, mcp), true);
+  f.tools.setPolicyForScope('conversation', 'tools', undefined, 'blocked result', {
+    read: { config: {}, autoSubmitResult: false }, write: { config: {}, autoSubmitResult: false }
+  });
+  const readTool = f.tools.toolDefinitions.find(tool => tool.name === 'read');
+  const count = f.messagesOf(T.ToolPolicyScopeSet).length;
+  assert.equal(view.toolGateValue(readTool, 'autoSubmitResult'), false);
+  view.restoreResultTool = readTool;
+  assert.equal(f.messagesOf(T.ToolPolicyScopeSet).length, count, '打开确认不放行');
+  view.confirmRestoreResult();
+  const restored = f.last(T.ToolPolicyScopeSet).payload.toolConfigs;
+  assert.equal(restored.read.autoSubmitResult, true);
+  assert.equal(restored.write.autoSubmitResult, false, '不恢复其它工具');
 });
 
 test('实际设置watcher跳过自发布，外部事件合并且读锁不触发循环', async t => {
@@ -287,4 +326,101 @@ test('实际设置watcher跳过自发布，外部事件合并且读锁不触发�
   assert.deepEqual(refreshed, ['appearance']);
   await f.clock.advance(180);
   assert.deepEqual(refreshed, ['appearance']);
+});
+
+function channelSettings(t) {
+  const f = graph.session(t);
+  const provider = id => ({ id, name: id, provider: 'openai-responses', baseUrl: 'https://api.openai.com/v1', apiKey: '',
+    model: `${id}-one`, models: [{ id: `${id}-one`, name: 'One' }, { id: `${id}-two`, name: 'Two' }], modelConfigs: [],
+    toolCallFormat: 'function-call', stream: true, retryOnError: true, retryMaxAttempts: 8, retryDelaySeconds: 0,
+    enableMultimodalTools: true, headers: {}, generationConfig: {}, requestBody: {}, createdAt: 1, updatedAt: 1 });
+  for (const [section, settings] of Object.entries({
+    llm: { activeProviderConfigId: 'A' }, llmProviderConfigs: { configs: [provider('A'), provider('B')] },
+    llmCompression: { defaultConfigId: 'compression', providerBindings: [], modelBindings: [] },
+    llmCompressionConfigs: { configs: [{ ...protocol.createDefaultLlmCompressionConfig('shared'), id: 'compression' }] }
+  })) f.global.applySnapshot({ section, settings, revision: `initial:${section}`, filePath: 'fixture' });
+  f.ack = write => f.global.applySnapshot({ ...write.payload, revision: `saved:${write.id}`, filePath: 'fixture' }, write.id);
+  return f;
+}
+
+test('浏览、新建和添加模型不激活；目标绑定编辑与迟到确认不串渠道', async t => {
+  const f = channelSettings(t), channel = f.mount('Channel').view;
+  channel.editingConfigId = 'B'; channel.editorModelId = 'B-two';
+  assert.equal(f.global.llm.activeProviderConfigId, 'A');
+  assert.equal(f.global.activeLlmProviderConfig.model, 'A-one');
+  assert.equal(channel.editingConfig.model, 'B-one');
+  channel.openNewModel(); channel.editingConfigId = 'A'; channel.confirmNewModel('B-three');
+  assert.equal(f.global.llmProviderConfigs.configs.find(item => item.id === 'B').model, 'B-one');
+  assert.ok(f.global.llmProviderConfigs.configs.find(item => item.id === 'B').models.some(item => item.id === 'B-three'));
+  const editor = f.mount('ChannelEditor', { providerConfigId: 'B' }).view;
+  editor.updateGenerationConfig({ temperature: 0.2 });
+  await f.clock.advance(400);
+  channel.confirmCreate('C'); const createdId = channel.editingConfigId;
+  assert.notEqual(createdId, 'A'); assert.equal(f.global.llm.activeProviderConfigId, 'A');
+  // Even a callback from the old editor remains bound to B, never to C or the true active A.
+  editor.updateGenerationConfig({ temperature: 0.3 });
+  editor.updateCompressionBodyTargetTokens(32000);
+  f.global.saveLlmProviderConfigs();
+  assert.equal(f.global.activeLlmProviderConfig.generationConfig.temperature, undefined);
+  assert.equal(f.global.llmProviderConfigs.configs.find(item => item.id === 'B').generationConfig.temperature, 0.3);
+  assert.equal(f.global.compressionConfigForProvider('B').bodyTargetTokens, 32000);
+  assert.notEqual(f.global.compressionConfigForProvider('A').id, f.global.compressionConfigForProvider('B').id);
+  f.global.selectLlmProviderConfig(createdId);
+  const providerWrites = () => f.messagesOf(T.GlobalSettingsUpdate).filter(item => item.payload.section === 'llmProviderConfigs');
+  f.ack(providerWrites()[0]);
+  assert.equal(f.global.llm.activeProviderConfigId, createdId);
+  assert.equal(f.messagesOf(T.GlobalSettingsUpdate).filter(item => item.payload.section === 'llm').length, 0, '旧ACK未包含新渠道，不提交选择');
+  f.ack(providerWrites().at(-1));
+  assert.equal(f.last(T.GlobalSettingsUpdate).payload.settings.activeProviderConfigId, createdId);
+  f.global.addModelToActiveConfig('C-model', undefined, createdId);
+  assert.equal(f.global.activeLlmProviderConfig.model, '');
+  f.global.selectLlmProviderConfigModel(createdId, 'C-model');
+  assert.equal(f.global.activeLlmProviderConfig.model, 'C-model');
+  const modelConfig = f.global.createModelConfigForActiveConfig('B-two', 'B');
+  const modelEditor = f.mount('ChannelEditor', { providerConfigId: 'B', modelConfigId: modelConfig.id }).view;
+  modelEditor.updateField({ retryMaxAttempts: 2 });
+  modelEditor.updateCompressionBodyTargetTokens(24000);
+  assert.equal(f.global.llmProviderConfigs.configs.find(item => item.id === 'B').modelConfigs[0].retryMaxAttempts, 2);
+  assert.equal(f.global.compressionConfigForProvider('B', 'B-two').bodyTargetTokens, 24000);
+  assert.equal(f.global.compressionConfigForProvider('B').bodyTargetTokens, 32000, '模型副本不反向改渠道默认');
+  f.global.deleteModelConfigFromActiveConfig(modelConfig.id, 'B');
+  assert.equal(modelEditor.config, undefined, '删除目标卸载缓存表单');
+  const bindings = f.global.llmCompression.modelBindings.length;
+  modelEditor.updateCompressionBodyTargetTokens(9999);
+  assert.equal(f.global.llmCompression.modelBindings.length, bindings, '被删除对象的迟到事件不能重建配置');
+  assert.doesNotThrow(() => structuredClone(f.messagesOf(T.GlobalSettingsUpdate).at(-1).payload));
+});
+
+test('专业参数编辑挂载不写默认，数值清空不落为0，思考档位复用能力集合', async t => {
+  const f = channelSettings(t), emitted = [];
+  const config = { ...f.global.activeLlmProviderConfig, model: 'gpt-6-astra' };
+  const parameterMount = f.mount('Parameters', { config, 'onUpdate-generation-config': value => emitted.push(value) });
+  const parameters = parameterMount.view;
+  assert.equal(emitted.length, 0);
+  const temperature = parameters.definitions.find(item => item.key === 'temperature');
+  parameters.updateKnownValue(temperature, 0.2);
+  assert.deepEqual(emitted.pop(), { temperature: 0.2 });
+  parameters.updateKnownValue(temperature, undefined);
+  assert.equal(emitted.pop(), undefined);
+  const thinking = parameters.definitions.find(item => item.key === 'thinkingLevel');
+  assert.ok(thinking.options.every(item => !['none', 'minimal'].includes(item.value)));
+  const advanced = f.mount('Advanced', { config,
+    'onUpdate-context-window-tokens': value => emitted.push(value), 'onUpdate-field': value => emitted.push(value) }).view;
+  assert.equal(emitted.length, 0);
+  advanced.updateContextWindowTokens({ target: { value: '' } });
+  assert.equal(emitted.pop(), undefined);
+  advanced.updateRetryMaxAttempts({ target: { value: '99' } });
+  assert.deepEqual(emitted.pop(), { retryMaxAttempts: 10 });
+  parameters.onJsonInput({ target: { value: '{bad' } });
+  parameters.onJsonBlur();
+  await parameterMount.setProps({ config: { ...config, requestBody: { peer: true } } });
+  assert.equal(parameters.jsonDraft, '{bad', '失焦后迟到快照不能覆盖无效JSON草稿');
+  parameters.resetJsonDraft();
+  assert.deepEqual(JSON.parse(parameters.jsonDraft), { peer: true });
+  await parameterMount.setProps({ config: { ...config, provider: 'claude', baseUrl: 'https://api.anthropic.com',
+    model: 'claude-sonnet-4-5', generationConfig: { maxOutputTokens: 4096 } } });
+  const claudeThinking = parameters.definitions.find(item => item.key === 'thinkingLevel');
+  assert.deepEqual(claudeThinking.options.map(item => item.value), ['none'], '预算模型仍可显式关闭思考');
+  parameters.updateKnownValue(claudeThinking, 'none');
+  assert.deepEqual(emitted.pop(), { maxOutputTokens: 4096, thinkingConfig: { thinkingLevel: 'none' } });
 });
