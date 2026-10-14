@@ -164,7 +164,7 @@ const promptCacheModeOptions: SettingsDropdownOption[] = [
 const promptCacheDescription = computed(() => {
   if (props.config.provider === 'openai-responses') {
     return promptCache.value.mode === 'explicit'
-      ? '显式断点模式会发送 prompt_cache_options 并放置缓存断点：HTTP 请求把断点放在本轮提醒等每次都会变的内容之前；WebSocket 连续请求在最新的消息和工具结果上放断点，服务端保留此前的断点。只有 GPT-5.6 及之后的模型支持，其他模型自动改用缓存 Key 模式；部分兼容渠道可能不支持该参数。'
+      ? '显式断点模式会发送 prompt_cache_options：读取点对准上一轮实际输入的末尾，写入点放在本轮输入末尾。HTTP 和 WebSocket 使用相同的规则。只有 GPT-5.6 及之后的模型支持，其他模型自动改用缓存 Key 模式；部分兼容渠道可能不支持该参数。'
       : '缓存 Key 模式会使用对话 ID 作为稳定的 prompt_cache_key；渠道请求体中自定义的 Key 优先生效。';
   }
   if (props.config.provider === 'claude') {
