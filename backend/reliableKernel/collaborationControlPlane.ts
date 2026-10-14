@@ -44,14 +44,12 @@ export const WAKE_CHARGE_ORIGIN_KIND = 'delivery_wake';
 /**
  * What a collaboration send does at its target: taken in by the running Turn; opens a Turn of the
  * idle target (now, or once the Turn it waits behind ends); or waits for the target's next Turn,
- * because the sender's final answer starts that Turn, because the automatic followup budget is
- * spent, or because this kind of message never wakes its target.
+ * because the automatic followup budget is spent or this kind of message never wakes its target.
  */
 export type CollaborationTargetDelivery =
   | 'delivered_to_running_turn'
   | 'wakes_target'
   | 'wakes_target_after_current_turn'
-  | 'waits_for_your_answer'
   | 'waits_budget_exhausted'
   | 'waits_for_next_turn';
 /**
@@ -319,7 +317,7 @@ export class CollaborationControlPlane {
     // wake waits behind a Turn that will not take it in); see collaborationWakePolicy for what
     // never wakes. A message is not woken when its budget is already spent: the binding check is
     // the transaction that opens the Turn, but a spent budget stays spent.
-    const targetDelivery = await this.targetDelivery({ input, source, sourceTurnId, sourceScope, targetConversationId, currentTurnId, activeTurnId: active[0] ? String(active[0].id) : null });
+    const targetDelivery = await this.targetDelivery({ input, source, sourceTurnId, sourceScope, currentTurnId, activeTurnId: active[0] ? String(active[0].id) : null });
     const wakes = targetDelivery === 'delivered_to_running_turn' || targetDelivery === 'wakes_target' || targetDelivery === 'wakes_target_after_current_turn';
     const wakeId = stablePhaseFId('runtime_delivery_wake', deliveryId);
     try {
@@ -354,21 +352,17 @@ export class CollaborationControlPlane {
     source: CollaborationSource | CompletionSource | BoardSource;
     sourceTurnId: string | null;
     sourceScope: CollaborationIdentity | null;
-    targetConversationId: string;
     currentTurnId: string | null;
     activeTurnId: string | null;
   }): Promise<CollaborationTargetDelivery> {
     if (input.currentTurnId) return 'delivered_to_running_turn';
     const wakes: CollaborationTargetDelivery = input.activeTurnId ? 'wakes_target_after_current_turn' : 'wakes_target';
-    const policy = await collaborationWakePolicy(this.database, this.contentStore, {
+    const policy = collaborationWakePolicy({
       mode: input.input.mode,
       sourceKind: input.source.kind,
-      crossConversation: input.input.crossConversation === true,
-      senderTurnId: input.sourceTurnId,
-      targetConversationId: input.targetConversationId
+      crossConversation: input.input.crossConversation === true
     });
     if (policy === 'never') return 'waits_for_next_turn';
-    if (policy === 'waits_for_answer') return 'waits_for_your_answer';
     if (input.input.mode === 'message' && input.source.kind === 'tool'
       && !await this.messageWakeBudgetAvailable(requirePhaseFId(input.sourceTurnId, 'turnId'), input.sourceScope?.rootTurnId ?? null)) {
       return 'waits_budget_exhausted';

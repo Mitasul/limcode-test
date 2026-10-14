@@ -564,7 +564,7 @@ export class AutomaticRuntimeDeliveryRouter {
       steps.push(DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').assert(String(fences[0].id), { turn_id: turn.id }));
       if (boardNotice) return decision({ ...input, sourceTurnId, reason: 'collaboration_notification_expired', authoritySteps: steps });
       // A message or reply that opens a Turn of its own does so once this finishing one ends.
-      const reason = await collaborationMessageWakePolicy(this.database, this.contentStore, String(message.id)) === 'opens_turn'
+      const reason = await collaborationMessageWakePolicy(this.database, String(message.id)) === 'opens_turn'
         ? 'collaboration_queued_behind_active_turn' : 'source_turn_final_output_fenced';
       return decision({ ...input, sourceTurnId, phase: 'next_turn', reason, childExecutionId: child ? String(child.id) : undefined, authoritySteps: steps });
     }

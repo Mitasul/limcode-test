@@ -549,7 +549,7 @@ export class ProcessCompletionDeliveryControlPlane {
       // A message or reply that opens a Turn of its own waits behind a Turn that has already
       // produced its final output and so can no longer take it in.
       return (await this.listRows('TurnFinalOutputFence', { turn_id: active.id }, 1)).length > 0
-        && await collaborationMessageWakePolicy(this.database, this.contentStore, messageId) === 'opens_turn';
+        && await collaborationMessageWakePolicy(this.database, messageId) === 'opens_turn';
     } catch {
       // Malformed facts surface through the normal claimed dispatch failure path.
       return false;
@@ -837,10 +837,8 @@ export class ProcessCompletionDeliveryControlPlane {
         requirePhaseFId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id')
       );
       if (!['process_receipt', 'answer_submission', 'collaboration_message'].includes(String(inbox.source_kind))) continue;
-      if (inbox.source_kind === 'collaboration_message' && delivery.state === 'pending') {
-        const message = await this.requireExisting('CollaborationMessage', String(inbox.source_id));
-        if (message.mode === 'message' && delivery.target_turn_id === null) continue;
-      }
+      if (inbox.source_kind === 'collaboration_message' && delivery.state === 'pending' && delivery.target_turn_id === null
+        && await collaborationMessageWakePolicy(this.database, String(inbox.source_id)) !== 'opens_turn') continue;
       if ((await this.ensureWakeForDelivery(delivery)).created) created += 1;
     }
     return created;
@@ -950,11 +948,10 @@ export class ProcessCompletionDeliveryControlPlane {
       const message = await this.requireExisting('CollaborationMessage', String(inbox.source_id));
       // A team message or a completion reply opens a Turn of its idle target (the continuation's
       // admission spends and checks the automatic budget; one idle period opens one Turn). A
-      // message the sender's answer will deliver, a board notice or a cross-conversation plain
-      // message never does: the target's next Turn takes it in, which needs no wake, so this one
-      // settles instead of polling until then.
+      // board notice or a cross-conversation plain message never does: the target's next Turn
+      // takes it in, which needs no wake, so this one settles instead of polling until then.
       if (message.mode === 'message'
-        && await collaborationMessageWakePolicy(this.database, this.contentStore, String(message.id)) !== 'opens_turn') {
+        && await collaborationMessageWakePolicy(this.database, String(message.id)) !== 'opens_turn') {
         return this.acknowledgeWake(wakeInput);
       }
     }

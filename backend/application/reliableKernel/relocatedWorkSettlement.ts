@@ -691,12 +691,11 @@ class RelocatedWorkSettlement {
     if (inbox?.source_kind !== 'collaboration_message') return true;
     const message = await this.get('CollaborationMessage', String(inbox.source_id));
     if (message?.mode !== 'message') return true;
-    // A plain message without a wake just waits for the next Turn (the wake sweep skips it).
+    // Missing wakes are reconstructed by recovery; settled wakes are never reopened.
     const wakes = await this.list('RuntimeDeliveryWake', { delivery_id: String(delivery.id) });
-    if (!wakes.some((wake) => wake.state === 'pending' || wake.state === 'claimed')) return false;
+    if (wakes.length > 0 && !wakes.some((wake) => wake.state === 'pending' || wake.state === 'claimed')) return false;
     return await collaborationMessageWakePolicy(
       this.application.database,
-      this.application.contentStore,
       String(message.id)
     ) === 'opens_turn';
   }

@@ -19,7 +19,7 @@ const driveChild = async child => {
 };
 const replies = async (conversationId, messageId) => (await f.app.runtime.collaboration.listMessages({ conversationId })).messages.filter(row => row.replyToMessageId === messageId);
 
-// The only two Runner integrations share this Runtime and its production wake handler.
+// Runner integrations use the production wake handler with synthetic provider responses.
 test('a child result arriving during the parent final output preserves that output and enters one continuation', { timeout: 8000 }, async () => {
   const parent = await f.parentTurn('final-fence'), child = await f.spawn(parent);
   await f.app.turns.terminal({ source: { kind: 'internal', key: f.id('parent-completed') }, turnId: parent.turnId, terminalStatus: 'completed', reason: 'Parent delegated its task' });
@@ -56,7 +56,8 @@ test('a child result arriving during the parent final output preserves that outp
   } finally { release.resolve(); f.model = async request => answer(`completed ${request.conversationId}`); }
 });
 
-test('two messages to an idle team member share one real Runner Turn with non-user provenance', { timeout: 8000 }, async () => {
+test('two parent messages automatically wake one idle child Turn with non-user provenance', { timeout: 8000 }, async () => {
+  const f = await openDeliveryFixture(), ready = gate();
   const parent = await f.parentTurn('coalesced'), child = await f.spawn(parent);
   await f.endTurn(child.childTurnId);
   await f.app.runtime.children.observeTurnTerminal(child.childExecutionId, child.childTurnId);
@@ -71,10 +72,14 @@ test('two messages to an idle team member share one real Runner Turn with non-us
     return answer('Read both team notes.');
   };
   try {
+    f.activateRunner({ ready: () => ready.promise });
+    await f.app.processDeliveries.start();
     const send = async text => f.app.runtime.collaboration.send({ source: await f.source(parent.conversationId, parent.turnId),
       targetConversationId: child.childConversationId, mode: 'message', text });
     const first = await send('FIRST_TEAM_NOTE'), second = await send('SECOND_TEAM_NOTE');
-    await f.app.processDeliveries.scanNow();
+    assert.equal(first.targetDelivery, 'wakes_target');
+    assert.equal(second.targetDelivery, 'wakes_target');
+    ready.resolve();
     await f.until(() => calls.length === 1, 'the message-woken child did not reach its provider');
     await f.coordinator.waitForIdle();
     assert.equal(new Set(calls).size, 1);
@@ -83,7 +88,107 @@ test('two messages to an idle team member share one real Runner Turn with non-us
     assert.equal((await f.get('RuntimeDelivery', first.deliveryId)).state, 'consumed');
     assert.equal((await f.rows('MessageTurnLink', { turn_id: target, role: 'user' })).length, 0);
     assert.equal((await f.rows('Turn', { conversation_id: child.childConversationId })).length, 2);
-  } finally { f.model = async request => answer(`completed ${request.conversationId}`); await f.deactivateRunner(); }
+    assert.equal((await f.rows('CollaborationBudget', { origin_kind: 'delivery_wake' })).length, 1);
+    assert.equal((await f.rows('AnswerSubmission')).length, 0, 'reading a message is not a new task answer');
+  } finally { ready.resolve(); await f.close(); }
+});
+
+test('child messages automatically wake the idle parent before its answer and keep the origin budget', { timeout: 10000 }, async () => {
+  const f = await openDeliveryFixture(), ready = gate(), entered = gate(), release = gate();
+  const parent = await f.parentTurn('child-note', { toolConfigs: { run_agent: { config: { maxAutomaticFollowups: 1 } } } });
+  const child = await f.spawn(parent), calls = [];
+  await f.endTurn(parent.turnId);
+  f.model = async (request, start) => {
+    if (request.conversationId === child.childConversationId) return answer('CHILD_EVENTUAL_ANSWER');
+    calls.push({ turnId: request.turnId, wire: JSON.stringify(start.contents) });
+    if (calls.length === 1) { entered.resolve(); await release.promise; }
+    return answer('Read the child update.');
+  };
+  try {
+    f.activateRunner({ ready: () => ready.promise });
+    await f.app.processDeliveries.start();
+    const sendFrom = async (from, targetConversationId, text) => {
+      const source = await f.source(from.conversationId, from.turnId);
+      const sent = await f.app.runtime.collaboration.send({ source, targetConversationId, mode: 'message', text });
+      await f.app.runtime.effects.settleWithoutEffect({ source: { kind: 'internal', key: `sent:${source.toolCallId}` },
+        toolCallId: source.toolCallId, status: 'succeeded', detail: sent });
+      return sent;
+    };
+    const sender = { conversationId: child.childConversationId, turnId: child.childTurnId };
+    const first = await sendFrom(sender, parent.conversationId, 'FIRST_CHILD_NOTE');
+    const second = await sendFrom(sender, parent.conversationId, 'SECOND_CHILD_NOTE');
+    assert.equal(first.targetDelivery, 'wakes_target');
+    assert.equal(second.targetDelivery, 'wakes_target');
+    ready.resolve();
+    await f.until(() => entered.settled, 'the child message did not automatically start the parent');
+    assert.match(calls[0].wire, /FIRST_CHILD_NOTE/); assert.match(calls[0].wire, /SECOND_CHILD_NOTE/);
+    assert.equal((await f.get('Turn', child.childTurnId)).status, 'active');
+    assert.equal((await f.rows('AnswerSubmission')).length, 0, 'the parent starts before the task answers');
+    const wakingTurn = calls[0].turnId;
+    for (const sent of [first, second]) {
+      assert.equal((await f.get('RuntimeDelivery', sent.deliveryId)).target_turn_id, wakingTurn);
+      assert.equal((await f.get('RuntimeDelivery', sent.deliveryId)).state, 'consumed');
+    }
+    assert.equal(f.coordinator.launch(child.childExecutionId, child.childTurnId), true);
+    await f.coordinator.activeTurns.get(child.childTurnId);
+    const back = await sendFrom({ conversationId: parent.conversationId, turnId: wakingTurn }, child.childConversationId, 'NO_REPLY_LOOP');
+    assert.equal(back.targetDelivery, 'waits_budget_exhausted', 'the parent continuation cannot reset the child message budget');
+    release.resolve();
+    await f.until(() => calls.length === 2, 'the eventual child answer was not delivered');
+    await f.runner.waitForIdle();
+    await f.until(async () => (await f.rows('RuntimeDeliveryWake', { delivery_id: back.deliveryId }))[0]?.state === 'acknowledged', 'the spent message wake did not settle');
+    await f.app.processDeliveries.scanNow();
+    assert.equal(calls.length, 2, 'one message Turn and one later answer Turn, without replay');
+    assert.match(calls[1].wire, /CHILD_EVENTUAL_ANSWER/);
+    assert.equal((await f.rows('Turn', { conversation_id: child.childConversationId })).length, 1);
+    assert.equal((await f.get('RuntimeDelivery', back.deliveryId)).state, 'pending');
+    const charges = await f.rows('CollaborationBudget', { origin_kind: 'delivery_wake' });
+    assert.equal(charges.length, 1); assert.equal(charges[0].authority_turn_id, parent.turnId);
+    for (const sent of [first, second]) assert.equal((await f.get('RuntimeDelivery', sent.deliveryId)).target_turn_id, wakingTurn);
+  } finally { ready.resolve(); release.resolve(); await f.close(); }
+});
+
+test('startup recovers child messages missing a wake without reopening settled wakes or a zero budget', { timeout: 10000 }, async t => {
+  const f = await openDeliveryFixture(), calls = [];
+  t.after(() => f.close());
+  const parent = await f.parentTurn('old-child-note'), child = await f.spawn(parent);
+  await f.endTurn(parent.turnId);
+  const send = async text => f.app.runtime.collaboration.send({ source: await f.source(child.childConversationId, child.childTurnId),
+    targetConversationId: parent.conversationId, mode: 'message', text });
+  const plane = f.app.runtime.collaboration, targetDelivery = plane.targetDelivery;
+  let missed;
+  // Replay the former producer: a child message committed without a wake outbox row.
+  plane.targetDelivery = async () => 'waits_for_next_turn';
+  try { missed = await send('RECOVER_CHILD_NOTE'); } finally { plane.targetDelivery = targetDelivery; }
+  assert.equal((await f.rows('RuntimeDeliveryWake', { delivery_id: missed.deliveryId })).length, 0);
+  const acknowledged = await send('ALREADY_ACKNOWLEDGED'), dead = await send('ALREADY_DEAD');
+  const wakes = await Promise.all([acknowledged, dead].map(async sent => (await f.rows('RuntimeDeliveryWake', { delivery_id: sent.deliveryId }))[0]));
+  await f.app.database.transaction([
+    repo('RuntimeDeliveryWake').update(wakes[0].id, { state: 'claimed', claim_owner_host_boot_id: f.app.database.hostBootId,
+      claim_generation: 1n, attempt_count: 1n, claim_expires_at: new Date(Date.now() + 60000).toISOString() }),
+    repo('RuntimeDeliveryWake').update(wakes[0].id, { state: 'acknowledged', acknowledged_at: f.now(), claim_owner_host_boot_id: null, claim_expires_at: null }),
+    repo('RuntimeDeliveryWake').update(wakes[1].id, { state: 'dead_letter', last_error: 'fixture-settled' })
+  ]);
+  const settled = await Promise.all(wakes.map(wake => f.get('RuntimeDeliveryWake', wake.id)));
+  const zeroParent = await f.parentTurn('zero-budget', { toolConfigs: { run_agent: { config: { maxAutomaticFollowups: 0 } } } });
+  const zeroChild = await f.spawn(zeroParent);
+  await f.endTurn(zeroParent.turnId);
+  const zero = await f.app.runtime.collaboration.send({ source: await f.source(zeroChild.childConversationId, zeroChild.childTurnId),
+    targetConversationId: zeroParent.conversationId, mode: 'message', text: 'WAIT_FOR_USER' });
+  assert.equal(zero.targetDelivery, 'waits_budget_exhausted');
+  f.model = async (request, start) => { calls.push(request.conversationId); assert.match(JSON.stringify(start.contents), /RECOVER_CHILD_NOTE/); return answer('Recovered the child update.'); };
+  f.activateRunner();
+  await f.app.processDeliveries.start();
+  await f.until(() => calls.length === 1, 'startup did not recover the pending child message');
+  await f.runner.waitForIdle();
+  await f.until(async () => (await f.rows('RuntimeDeliveryWake', { delivery_id: zero.deliveryId }))[0]?.state === 'acknowledged', 'zero-budget wake did not settle');
+  await f.app.processDeliveries.scanNow();
+  assert.deepEqual(calls, [parent.conversationId]);
+  assert.equal((await f.get('RuntimeDelivery', missed.deliveryId)).state, 'consumed');
+  assert.equal((await f.get('RuntimeDeliveryWake', kernel.stablePhaseFId('runtime_delivery_wake', missed.deliveryId))).state, 'acknowledged');
+  assert.deepEqual(await Promise.all(wakes.map(wake => f.get('RuntimeDeliveryWake', wake.id))), settled);
+  assert.equal((await f.get('RuntimeDelivery', zero.deliveryId)).state, 'pending');
+  assert.equal((await f.rows('Turn', { conversation_id: zeroParent.conversationId })).length, 1);
 });
 
 test('a task final answer is durable before Turn completion and a failed delivery handoff recovers once', async () => {

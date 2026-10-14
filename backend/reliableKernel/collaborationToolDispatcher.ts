@@ -330,7 +330,6 @@ const TARGET_DELIVERY_NOTES: Readonly<Record<string, string>> = {
   delivered_to_running_turn: 'The target is running and reads this at its next safe input boundary.',
   wakes_target: 'The target was idle; this starts a turn of the target to read it.',
   wakes_target_after_current_turn: 'The target\'s current turn cannot take this in; it starts the target\'s next turn once that one ends.',
-  waits_for_your_answer: 'Not started: your final answer goes to this conversation and starts its turn, which reads this then.',
   waits_budget_exhausted: 'Not started: the automatic follow-up budget is spent. The target reads this when its next turn starts.',
   waits_for_next_turn: 'The target reads this when its next turn starts.'
 };

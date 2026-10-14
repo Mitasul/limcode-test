@@ -181,9 +181,9 @@ export async function openDeliveryFixture() {
     app = await kernel.ReliableKernelApplication.open(root, dependencies);
     f.lifecycle = new ReliableConversationLifecycle({ application: app, configuration });
   };
-  f.activateRunner = () => {
+  f.activateRunner = (options = {}) => {
     runner ??= new ReliableConversationRunner(app, 'delivery-suite-owner', error => { f.errors.push(error); });
-    const wake = createRuntimeDeliveryWakeHandler({ application: () => app, conversations: () => runner, children: () => coordinator });
+    const wake = createRuntimeDeliveryWakeHandler({ application: () => app, conversations: () => runner, children: () => coordinator, ready: options.ready });
     app.processDeliveries.setWakeHandler(wake);
     return runner;
   };
