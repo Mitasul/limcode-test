@@ -330,6 +330,7 @@ async function isolatedNativeRuntime(run, { transport = 'websocket', realAuthori
       async resetCase(options = {}) {
         releaseTool.resolve(); releaseTool = deferred(); frames.length = 0; executions = 0; httpCalls = 0; turnFailure = undefined;
         transport = options.transport ?? "websocket"; configuration.openaiResponsesTransport = transport;
+        configuration.promptCache = options.promptCache ?? { enabled: false, mode: 'key', ttl: '30m' };
         configuration.model = MODEL; configuration.models = [{ id: MODEL, name: MODEL }]; configuration.generationConfig = undefined;
         conversationId = `native-shared-${++nativeCaseSequence}`; activeConversationId = conversationId;
         resetOpenAIResponsesWebSocketSessions();
@@ -491,6 +492,15 @@ test('native SSE admits async work before completion and resumes statelessly wit
     const first = await until(() => frames.find(frame => frame.response), 'native SSE request');
     assert.equal(first.body.tools.find(tool => tool.name === 'native_probe')?.async, true);
     assert.equal(first.body.store, false);
+    assert.equal(first.body.prompt_cache_options.mode, 'explicit');
+    const breakpointIndexes = input => input.flatMap((item, index) => {
+      const blocks = item.type === 'function_call_output' ? item.output : item.content;
+      return Array.isArray(blocks) && blocks.some(block => block.prompt_cache_breakpoint !== undefined) ? [index] : [];
+    });
+    const firstWriteIndex = breakpointIndexes(first.body.input).at(-1);
+    assert.equal(firstWriteIndex, first.body.input.length - 1, 'the initial POST writes through its actual last input');
+    assert.equal(first.body.readBreakpointBeforeContentIndex, undefined);
+    assert.equal(first.body.readBreakpointBeforeItemIndex, undefined);
     created(first.response, 'native-sse-response-1');
     const prefix = text(first.response, 'native-sse-response-1', 0, 'Before the SSE background call.');
     const call = {
@@ -521,6 +531,16 @@ test('native SSE admits async work before completion and resumes statelessly wit
     assert.equal(calls[0].async, true);
     assert.equal(results[0].call_id, 'original-native-sse-call');
     assert.match(JSON.stringify(results[0].output), /content from the real native probe file/);
+    assert.deepEqual(delivery.body.input.slice(0, first.body.input.length), first.body.input,
+      'the physical continuation retains the entire previous input and its read breakpoint');
+    assert.ok(breakpointIndexes(delivery.body.input).includes(firstWriteIndex),
+      'the next POST reads at the previous physical POST input endpoint');
+    assert.ok(results.every(item => Array.isArray(item.output)), 'explicit HTTP tool outputs use cacheable content arrays');
+    assert.ok(results[0].output.at(-1).prompt_cache_breakpoint,
+      'the latest tool output carries the next write breakpoint');
+    assert.equal(breakpointIndexes(delivery.body.input).at(-1), delivery.body.input.length - 1);
+    assert.equal(delivery.body.readBreakpointBeforeContentIndex, undefined);
+    assert.equal(delivery.body.readBreakpointBeforeItemIndex, undefined);
     created(delivery.response, 'native-sse-response-2');
     completed(delivery.response, 'native-sse-response-2', [
       text(delivery.response, 'native-sse-response-2', 0, 'SSE result received.')
@@ -534,7 +554,7 @@ test('native SSE admits async work before completion and resumes statelessly wit
     assert.equal(harness.httpCalls(), 2);
     assert.equal(frames.some(frame => frame.socket), false);
     assert.deepEqual(await app.runtime.effects.listNativePendingWork({ conversationId }), []);
-  }, { transport: 'http' });
+  }, { transport: 'http', promptCache: { enabled: true, mode: 'explicit', ttl: '30m' } });
 });
 test('accepted steer and required result on one predecessor apply the steer, continue from Context without false admission or chain replay', { timeout: 30_000 }, async () => {
   await withNativeRuntime(async harness => {

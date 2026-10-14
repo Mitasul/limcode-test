@@ -14,14 +14,14 @@ import { buildModelHandleCatalog, CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISIO
   mergeModelHandleCatalogs, ModelHandleIdentityConflictError,
   reconcileHistoricalModelHandleCatalogs, type ModelHandleCatalog,
   type ModelHandleEntry, type ModelHandleKind } from './modelHandleCatalog';
-import { modelRequestIdFor } from './modelProviderControlPlane';
+import { originalNativeMessageRevisionId, nativeMessageRevisionItemKey } from './contextNativeMessageProvenance';
 import { parseNativeToolCallCheckpoint } from './nativeToolFacts';
 import type { PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import { nativeItemRevisionId } from './turnOutput';
-import { projectTurnReminder, recipeReinjectedCurrentTurnInput, recipeSentClaudeTurnScopedReminders } from './turnReminderProjection';
+import { projectTurnReminder, recipeReinjectedCurrentTurnInput, recipeTurnReminderDelivery } from './turnReminderProjection';
 
 /** A producer lookup is private. Only identities used by this immutable occurrence are published. */
 export type ContextHandleOccurrenceEvidence =
@@ -195,7 +195,7 @@ export async function readContextHandleRootEvidence(database: RuntimeDatabase, s
           if (!membership.length) continue;
           if (membership.length !== 1 || revision.revision_seq !== source.source_revision
             || revision.content_object_id !== segment.content_object_id) throw invalid('Message occurrence provenance conflicts with its revision.');
-          const requestId = await reader.producerForRevision(revision, conversationId);
+          const requestId = await reader.producerForRevision(revision, sources);
           unit.occurrences.push({ kind: 'message', ...(requestId ? { modelRequestId: requestId } : {}),
             content: '' });
           unit.messageRevision = revision;
@@ -503,7 +503,7 @@ class OccurrenceReader {
           }
         }
         const normalized = parsed as { [key: string]: PlainJsonValue };
-        const scoped = recipeSentClaudeTurnScopedReminders(normalized);
+        const scoped = recipeTurnReminderDelivery(normalized) !== undefined;
         const reminder = scoped ? projectTurnReminder(normalized)?.content : undefined;
         const reinjectedContentId = scoped ? recipeReinjectedCurrentTurnInput(normalized)?.contentObjectId : undefined;
         // Only compression's one-time exact legacy source proof needs its full recipe shape.
@@ -660,6 +660,10 @@ class OccurrenceReader {
       if (occurrence.kind === 'tool_call') {
         values.push((await this.content(id(call.arguments_object_id))).text);
         const admissions = await this.list('ToolCallEvent', { tool_call_id: occurrence.toolCallId, event_kind: 'native_admission' });
+        if (admissions.length > 0) {
+          if (evidence.reminder) values.push(evidence.reminder);
+          if (evidence.reinjectedContentId) values.push((await this.content(evidence.reinjectedContentId)).text);
+        }
         for (const admission of admissions) {
           const value = object(JSON.parse((await this.content(id(admission.content_object_id))).text), 'Native admission');
           if (typeof value.checkpointId !== 'string') continue;
@@ -745,26 +749,23 @@ class OccurrenceReader {
       throw invalid('Native projection does not belong to the selected immutable result.');
     }
   }
-  public async producerForRevision(revision: DomainRow, conversationId: string): Promise<string | undefined> {
+  public async producerForRevision(revision: DomainRow, sources: readonly DomainRow[]): Promise<string | undefined> {
     if (revision.role !== 'model') return undefined;
     const links = await this.list('ModelRequestMessageLink', { message_id: revision.message_id });
     if (!links.length) throw invalid('Model Message has no producing request provenance.');
     if (links.length !== 1) throw invalid('Model Message has multiple producing requests.');
     const requestId = id(links[0].model_request_id);
     if (BigInt(String(revision.revision_seq)) === 1n) return requestId;
-    const parsed = maybeObject(parseJson((await this.content(id(revision.content_object_id))).text));
-    const parts = parsed?.parts;
-    const item = Array.isArray(parts) && parts.length === 1 ? maybeObject(maybeObject(parts[0])?.outputItem) : undefined;
-    if (!item || typeof item.providerResponseId !== 'string' || !Number.isSafeInteger(item.ordinal)) return undefined;
+    const itemKey = nativeMessageRevisionItemKey((await this.content(id(revision.content_object_id))).text);
+    if (!itemKey) return undefined;
     const evidence = await this.request(requestId);
-    const itemKey = `content:${item.providerResponseId}:${String(item.ordinal)}`;
     if (revision.id === nativeItemRevisionId(id(evidence.request.turn_id), requestId, itemKey)) return requestId;
     const authority = await this.get('AuthoritySnapshot', id(evidence.request.authority_snapshot_id));
     const original = object(JSON.parse((await this.content(id(authority.content_object_id))).text), 'Copied authority');
     if (typeof original.turnId !== 'string' || typeof evidence.recipe.round !== 'string') return undefined;
-    const originalRequest = modelRequestIdFor(original.turnId, `agent-loop:${original.turnId}:round:${evidence.recipe.round}`);
-    if (await this.matchesCopy(conversationId, 'model_request', originalRequest, requestId)
-      && await this.matchesCopy(conversationId, 'message_revision', nativeItemRevisionId(original.turnId, originalRequest, itemKey), id(revision.id))) return requestId;
+    const originalRevisionId = originalNativeMessageRevisionId(original.turnId, evidence.recipe.round, itemKey);
+    if (sources.some(source => source.source_kind === 'message_revision'
+      && source.source_id === originalRevisionId && source.source_revision === revision.revision_seq)) return requestId;
     return undefined; // A later user edit keeps MessageRequestLink but owns no provider recipe.
   }
   public async compressionRequest(block: DomainRow, conversationId: string): Promise<RequestEvidence | undefined> {

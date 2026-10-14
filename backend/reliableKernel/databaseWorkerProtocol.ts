@@ -90,7 +90,9 @@ export interface ContextMaterializationRecord {
   /** Immutable MessageRevision role resolved through ContextSegmentSource; NULL for non-message segments. */
   messageRole: string | null;
   modelSource?: ContextModelSource;
-  /** Frozen recipe ContentObject of the ModelRequest whose output this model message segment is. */
+  /** Producing request of a model message or tool-call occurrence. */
+  sourceModelRequestId?: string;
+  /** Frozen recipe ContentObject of the request that produced this occurrence. */
   sourceRecipeObjectId?: string;
   sourceReminderAuthority?: ContextReminderAuthoritySource;
   /** Claude 保留思考处理：产生这条模型输出的 ModelRequest 实际发出时这个对话已选定的处理（stream_stats 里的持久记录）。 */

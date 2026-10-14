@@ -1,5 +1,4 @@
 import { nativeSessionCapabilities } from '../../shared/nativeSessionCapabilities';
-import { createHash } from 'crypto';
 import { discoverAnthropicModels } from './modelCapabilityDiscovery';
 import { resolveSummaryOutputBudget } from '../../shared/summaryOutputBudget';
 import { anthropicModelReasoningCapability, resolveProviderModelCapabilities } from '../../shared/modelCapabilities';
@@ -40,15 +39,10 @@ import {
   type ProviderRequestTarget
 } from './providerParameterAdaptation';
 import {
-  layoutTurnReminderContents,
   withClaudeCacheBreakpointBeforeVolatileTail,
-  withClaudeTurnScopedSystemBeta,
-  type TurnReminderLayout
+  withClaudeTurnScopedSystemBeta
 } from './claudeTurnScopedReminders';
-import {
-  withOpenAIResponsesCacheBreakpointBeforeVolatileTail,
-  type OpenAIResponsesHttpReplay
-} from './openAIResponsesTailCacheBreakpoint';
+import { layoutTurnReminderContents, type TurnReminderLayout } from './turnReminderLayout';
 import { installPlainTextToolResultCompactEncoding, withPlainTextToolResultRequest } from './textToolResultEncoding';
 import {
   assertCanonicalProviderToolContext,
@@ -250,7 +244,6 @@ export interface LlmProviderTransportTrace {
     | 'http_fallback'
     | 'http_cooldown';
   observedAt: number;
-  sessionKeyHash: string;
   connectionGeneration: number;
   elapsedMs?: number;
   connectionReused?: boolean;
@@ -509,22 +502,18 @@ export async function startLlmProvider(
       conversationId: request.conversationId,
       claudeThinkingBinding: request.claudeThinkingBinding
     });
-    // WebSocket 模式下 provider 只用来取 WebSocket 帧（续接链）；回退用的 HTTP provider 是无状态完整重放。
-    // HTTP 原生会话里同一个 provider 发首请求与续接请求（续接在原内容后追加），断点按会话方式放。
     const provider = installRequestAdaptation(installProviderCompatibility(
       unified.createLLMFromConfig(providerConfig, registry.llmProviders) as UnifiedChatProvider,
       settings.provider,
       settings.model
-    ), settings, claudeTurnScoped, volatileTailCount, isOpenAIResponsesWebSocketMode(settings),
-    openAIResponsesHttpReplay(settings, nativeCapabilities), adaptationSession);
+    ), settings, claudeTurnScoped, volatileTailCount, adaptationSession);
     const httpFallbackProvider = isOpenAIResponsesWebSocketMode(settings)
       ? installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
           ...providerConfig,
-          ...unifiedPromptCacheConfigEntry(settings, requestBody, false),
+          ...unifiedPromptCacheConfigEntry(settings, requestBody),
           transport: undefined,
           webSocketSessionKey: undefined
-        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings, claudeTurnScoped, volatileTailCount, false,
-        'stateless', adaptationSession)
+        }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings, claudeTurnScoped, volatileTailCount, adaptationSession)
       : undefined;
 
     const retryEnabled = settings.retryOnError !== false;
@@ -1031,7 +1020,7 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
   }
   const cooldownUntil = openAIResponsesHttpCooldowns.get(sessionKey) ?? 0;
   if (input.httpFallbackProvider && cooldownUntil > now) {
-    reportTransportPolicyTrace(input, sessionKey, 'http_cooldown', 'temporary_ws_cooldown');
+    reportTransportPolicyTrace(input, 'http_cooldown', 'temporary_ws_cooldown');
     yield* input.httpFallbackProvider.chatStream<LimCodeOpenAIResponsesStreamChunk>(input.unifiedRequest, {
       inputFormat: 'unified',
       outputFormat: 'unified',
@@ -1045,7 +1034,7 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
     && now - reliableAttempt.requestCreatedAt >= OPENAI_RESPONSES_WS_RETRY_BUDGET_MS;
   if (input.httpFallbackProvider && retryTimeBudgetExhausted) {
     openAIResponsesHttpCooldowns.set(sessionKey, now + OPENAI_RESPONSES_HTTP_COOLDOWN_MS);
-    reportTransportPolicyTrace(input, sessionKey, 'http_fallback', 'ws_retry_time_budget_exhausted');
+    reportTransportPolicyTrace(input, 'http_fallback', 'ws_retry_time_budget_exhausted');
     yield* input.httpFallbackProvider.chatStream<LimCodeOpenAIResponsesStreamChunk>(input.unifiedRequest, {
       inputFormat: 'unified',
       outputFormat: 'unified',
@@ -1086,7 +1075,6 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
           conversationId,
           phase: 'continuation_decision',
           observedAt: Date.now(),
-          sessionKeyHash: decision.sessionKeyHash,
           connectionGeneration: decision.connectionGeneration,
           connectionReused: decision.connectionReused,
           connectionReason: decision.connectionReason,
@@ -1099,7 +1087,6 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
           implementation: LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION,
           requestId: input.request.id,
           conversationId: input.request.conversationId ?? '',
-          sessionKeyHash: decision.sessionKeyHash,
           connectionGeneration: decision.connectionGeneration,
           connectionReused: decision.connectionReused,
           connectionReason: decision.connectionReason,
@@ -1115,7 +1102,7 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
   } catch (error) {
     if (!input.httpFallbackProvider || !shouldFallbackOpenAIResponsesToHttp(input, error)) throw error;
     openAIResponsesHttpCooldowns.set(sessionKey, Date.now() + OPENAI_RESPONSES_HTTP_COOLDOWN_MS);
-    reportTransportPolicyTrace(input, sessionKey, 'http_fallback', 'ws_retry_budget_exhausted');
+    reportTransportPolicyTrace(input, 'http_fallback', 'ws_retry_budget_exhausted');
     yield* input.httpFallbackProvider.chatStream<LimCodeOpenAIResponsesStreamChunk>(input.unifiedRequest, {
       inputFormat: 'unified',
       outputFormat: 'unified',
@@ -1228,6 +1215,7 @@ async function* streamOpenAIResponsesNativeHttpSession(input: {
   // 进入集合，只有随续流真实交付（drain 进出站历史）才移除；部分就绪不影响其余未决项。
   const pendingNativeCallIds = new Set<string>();
   let contents = input.unifiedRequest.contents;
+  let readBreakpointBeforeContentIndex = input.unifiedRequest.readBreakpointBeforeContentIndex;
   try {
     for (;;) {
       const drained = queue.splice(0, queue.length);
@@ -1240,7 +1228,7 @@ async function* streamOpenAIResponsesNativeHttpSession(input: {
       const responseContents: UnifiedContent[] = [];
       try {
         for await (const chunk of input.provider.chatStream<UnifiedLLMStreamChunk>(
-          { ...input.unifiedRequest, contents },
+          { ...input.unifiedRequest, contents, readBreakpointBeforeContentIndex },
           { inputFormat: 'unified', outputFormat: 'unified', signal: input.signal }
         )) {
           const nativeChunk = chunk as OpenAIResponsesHttpNativeStreamChunk;
@@ -1296,6 +1284,7 @@ async function* streamOpenAIResponsesNativeHttpSession(input: {
         });
       }
       if (queue.length === 0) break;
+      readBreakpointBeforeContentIndex = contents.length;
       contents = [
         ...contents,
         ...responseContents,
@@ -1416,7 +1405,6 @@ function reportTransportPolicyTrace(
     request: LlmStartRequest;
     onTransportTrace?: (trace: LlmProviderTransportTrace) => void;
   },
-  sessionKey: string,
   phase: 'http_fallback' | 'http_cooldown',
   reason: string
 ): void {
@@ -1425,7 +1413,6 @@ function reportTransportPolicyTrace(
     conversationId: input.request.conversationId ?? '',
     phase,
     observedAt: Date.now(),
-    sessionKeyHash: createHash('sha256').update(sessionKey).digest('hex').slice(0, 12),
     connectionGeneration: 0,
     reason
   });
@@ -1472,7 +1459,6 @@ function traceFromWebSocketPhase(
     conversationId: input.request.conversationId ?? '',
     phase: phase.phase,
     observedAt: phase.observedAt,
-    sessionKeyHash: phase.sessionKeyHash,
     connectionGeneration: phase.connectionGeneration,
     ...(phase.elapsedMs !== undefined ? { elapsedMs: phase.elapsedMs } : {}),
     ...(phase.connectionReused !== undefined ? { connectionReused: phase.connectionReused } : {}),
@@ -1751,7 +1737,6 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     fetch: providerFetch
   }, registry.llmProviders) as UnifiedChatProvider, runtimeSettings.provider, runtimeSettings.model), runtimeSettings,
   claudeTurnScopedRemindersRequested(request, runtimeSettings), volatileTailContentCount(request),
-  isOpenAIResponsesWebSocketMode(runtimeSettings), openAIResponsesHttpReplay(runtimeSettings, nativeCapabilities),
   createProviderRequestAdaptationSession({
     conversationId: request.conversationId,
     claudeThinkingBinding: request.claudeThinkingBinding
@@ -2590,7 +2575,7 @@ async function buildAnthropicCompactionRequest(
     ...(proxy ? { proxy } : {}),
     fetch: providerFetch
   }, registry.llmProviders) as UnifiedChatProvider, settings.provider, settings.model), settings,
-  claudeTurnScopedRemindersRequested(request, settings), 0, false, 'stateless',
+  claudeTurnScopedRemindersRequested(request, settings), 0,
   options.requestAdaptationSession ?? createProviderRequestAdaptationSession({
     conversationId: request.conversationId,
     claudeThinkingBinding: request.claudeThinkingBinding
@@ -5418,17 +5403,13 @@ function withUserRequestBodyRejection(
  * 编码后请求的最终适配：先按模型族做静态适配（Claude 思考类型；GPT-6 Sol / Luna 按实际推理强度去掉
  * 采样参数，Astra 一律去掉），再应用按目标记住的不支持参数与 Claude 保留思考处理（进程内学习），最后为 Claude
  * 轮内系统消息合并 beta 头；Claude 尾巴模式下把消息缓存断点挪到易失尾巴（本轮提醒、重新注入的输入）之前。
- * OpenAI Responses 显式缓存在无状态完整重放（HTTP、WebSocket 回退的 HTTP、HTTP dry-run）下同样挪到尾巴之前；
- * `webSocketChain` 表示编码结果交给 WebSocket 续接链（含 WebSocket dry-run 展示的首帧）：尾巴随 previous_response_id
- * 留在服务端会话的原位，下一帧的会话里仍有它和它的断点，不是易失的，断点留在尾巴上。
+ * Responses 的缓存断点由编码器按实际历史边界生成。
  */
 function installRequestAdaptation<T>(
   provider: T,
   settings: LlmProviderConfigRecord,
   claudeTurnScopedReminders = false,
   volatileTailCount = 0,
-  webSocketChain = false,
-  httpReplay: OpenAIResponsesHttpReplay = 'stateless',
   session?: ProviderRequestAdaptationSession
 ): T {
   const target = providerRequestTarget(settings);
@@ -5445,9 +5426,6 @@ function installRequestAdaptation<T>(
       applyLearnedRequestAdaptations(adaptOpenAICompatibleDialect(shaped, settings), target, session),
       settings.provider
     );
-    if (settings.provider === 'openai-responses') {
-      return webSocketChain ? adapted : withOpenAIResponsesCacheBreakpointBeforeVolatileTail(adapted, volatileTailCount, httpReplay);
-    }
     if (settings.provider !== 'claude') return adapted;
     const turnScoped = claudeTurnScopedReminders && !claudeTurnScopedRemindersFallenBack(target);
     // 轮内系统消息模式下尾巴内容之后会在原位原样重发，不是易失的；只有尾巴模式才挪断点。
@@ -5470,13 +5448,6 @@ function usesOpenAIResponsesNativeHttpSession(
     && !isOpenAIResponsesWebSocketMode(settings)
     && settings.stream !== false
     && nativeCapabilities?.asyncTools === true;
-}
-
-function openAIResponsesHttpReplay(
-  settings: LlmProviderConfigRecord,
-  nativeCapabilities: OpenAIResponsesNativeCapabilities | undefined
-): OpenAIResponsesHttpReplay {
-  return usesOpenAIResponsesNativeHttpSession(settings, nativeCapabilities) ? 'native_session' : 'stateless';
 }
 
 /** 内核放在内容末尾、下一次请求不再原位出现的条数（重新注入的输入、本轮提醒）。 */
@@ -5792,17 +5763,15 @@ function normalizePromptCacheTtl(input: unknown, provider: LlmProviderKind): Llm
 
 function unifiedPromptCacheConfigEntry(
   settings: LlmProviderConfigRecord,
-  requestBody?: LlmRequestBodyRecord,
-  webSocket = isOpenAIResponsesWebSocketMode(settings)
+  requestBody?: LlmRequestBodyRecord
 ): { promptCache: Record<string, unknown> } | Record<string, never> {
-  const promptCache = unifiedPromptCacheFromSettings(settings, requestBody, webSocket);
+  const promptCache = unifiedPromptCacheFromSettings(settings, requestBody);
   return promptCache ? { promptCache } : {};
 }
 
 function unifiedPromptCacheFromSettings(
   settings: LlmProviderConfigRecord,
-  requestBody: LlmRequestBodyRecord | undefined,
-  webSocket: boolean
+  requestBody: LlmRequestBodyRecord | undefined
 ): Record<string, unknown> | undefined {
   if (!isPromptCacheSupportedProvider(settings.provider)) return undefined;
   const promptCache = normalizePromptCache(settings.promptCache, settings.provider);
@@ -5822,10 +5791,8 @@ function unifiedPromptCacheFromSettings(
       enabled: true,
       mode: 'explicit',
       ttl: promptCache.ttl,
-      // WebSocket 续接链里服务端保留此前各帧的断点（Responses 参考：“considers up to the latest 80
-      // breakpoints in the conversation”），工具结果改用数组形式后每帧的断点能落在最新的工具结果上；
-      // 无状态 HTTP 完整重放只有一个随请求移动的断点，保持原来的字符串形式。
-      breakpoints: webSocket ? { messages: true, toolOutputs: true } : { messages: true },
+      // HTTP 与 WebSocket 共用数组工具结果编码，使同一段输入的缓存断点位置保持一致。
+      breakpoints: { messages: true, toolOutputs: true },
       ...(key ? { key } : {})
     };
   }
@@ -5845,19 +5812,8 @@ function requestBodyWithOpenAIPromptCacheKey(settings: LlmProviderConfigRecord, 
   if (!promptCache.enabled || !conversationId?.trim()) return requestBody;
   return {
     ...(requestBody ?? {}),
-    prompt_cache_key: createOpenAIPromptCacheKey(settings, conversationId)
+    prompt_cache_key: conversationId
   };
-}
-
-function createOpenAIPromptCacheKey(settings: LlmProviderConfigRecord, conversationId: string): string {
-  return createHash('sha256')
-    .update([
-      settings.id,
-      settings.model,
-      conversationId
-    ].join('\n'))
-    .digest('hex')
-    .slice(0, 32);
 }
 
 function openAIResponsesWebSocketConfigEntry(settings: LlmProviderConfigRecord, conversationId?: string): { transport?: 'websocket'; webSocketSessionKey?: string } {
@@ -5938,16 +5894,13 @@ export function createOpenAIResponsesWebSocketSessionKey(
   settings: LlmProviderConfigRecord,
   conversationId: string
 ): string {
-  return createHash('sha256')
-    .update([
-      'openai-responses-websocket',
-      settings.id,
-      settings.baseUrl,
-      settings.model,
-      requireOpenAIResponsesWebSocketConversationId(conversationId)
-    ].join('\n'))
-    .digest('hex')
-    .slice(0, 32);
+  return JSON.stringify([
+    'openai-responses-websocket',
+    settings.id,
+    settings.baseUrl,
+    settings.model,
+    requireOpenAIResponsesWebSocketConversationId(conversationId)
+  ]);
 }
 
 function requireOpenAIResponsesWebSocketConversationId(conversationId: string | undefined): string {

@@ -28,7 +28,7 @@ import {
   thoughtSignaturesFromPortableSignature
 } from './llmStreamEventProjection';
 import type { OpenAIResponsesNativeCapabilities } from '../../shared/openAIResponsesNative';
-import { layoutTurnReminderContents, type TurnReminderLayout } from './claudeTurnScopedReminders';
+import { projectTurnReminderLayout, type TurnReminderLayout } from './turnReminderLayout';
 
 type UnifiedContent = import('unified-llm-provider').Content;
 type UnifiedPart = import('unified-llm-provider').Part;
@@ -43,11 +43,13 @@ export function toUnifiedRequest(
   turnReminderLayout: TurnReminderLayout = 'tail'
 ): UnifiedLLMRequest {
   const nativeAsync = nativeCapabilities?.asyncTools === true;
-  // 轮内系统消息只发给 Claude；其他 provider 一律按原来的尾巴模式，历史提醒不会以任何形式发过去。
-  const requestContents = layoutTurnReminderContents(
+  // user 快照始终保持 user；Claude 专用系统消息只在其冻结设置启用时发送。
+  const laidOut = projectTurnReminderLayout(
     request.contents,
-    providerKind === 'claude' && turnReminderLayout === 'claude_turn_scoped' ? 'claude_turn_scoped' : 'tail'
+    providerKind === 'claude' && turnReminderLayout === 'claude_turn_scoped' ? 'claude_turn_scoped' : 'tail',
+    providerKind === 'openai-responses' ? request.readBreakpointBeforeContentIndex : undefined
   );
+  const requestContents = laidOut.contents;
   const contents = providerKind === 'gemini'
     ? mergeGeminiFunctionResponseTurns(projectGeminiThoughtReplay(projectGeminiProviderContext(requestContents)))
     : providerKind === 'claude'
@@ -55,8 +57,16 @@ export function toUnifiedRequest(
       : providerKind === 'openai-compatible'
         ? projectOpenAICompatibleThoughtReplay(projectForeignProviderContext(requestContents, 'openai-compatible'))
         : requestContents;
+  const unifiedContents: UnifiedContent[] = [];
+  let readBoundary: number | undefined;
+  contents.forEach((content, index) => {
+    if (index === laidOut.readBreakpointBeforeContentIndex) readBoundary = unifiedContents.length;
+    unifiedContents.push(...toUnifiedContents(content, providerKind, nativeAsync));
+  });
+  if (laidOut.readBreakpointBeforeContentIndex === contents.length) readBoundary = unifiedContents.length;
   return {
-    contents: contents.flatMap((content) => toUnifiedContents(content, providerKind, nativeAsync)),
+    contents: unifiedContents,
+    ...(readBoundary === undefined ? {} : { readBreakpointBeforeContentIndex: readBoundary }),
     ...(request.systemInstruction ? { systemInstruction: { parts: request.systemInstruction.parts.map((part) => toUnifiedPart(part, false)) } } : {}),
     ...(request.tools.length === 0 ? {} : {
       tools: [{

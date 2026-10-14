@@ -87,9 +87,10 @@ import {
   turnReminderDeliveries,
   visibleHistoryTurnReminder,
   type TurnReminderLayout
-} from '../capabilities/claudeTurnScopedReminders';
+} from '../capabilities/turnReminderLayout';
 import { claudeTurnScopedRemindersFallenBackForModel } from '../capabilities/providerParameterAdaptation';
-import { claudeTurnScopedCompaction, type TurnReminderIdentitySplit } from './turnReminderProjection';
+import { claudeTurnScopedCompaction, recipeTurnReminderDelivery, reminderHistoryForRequest,
+  type TurnReminderDeliveryMode, type TurnReminderIdentitySplit } from './turnReminderProjection';
 import {
   openAICompatibleModelReadsGeminiSignatures,
   withoutGeminiFunctionCallSignatures
@@ -879,10 +880,11 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
     .map((tool) => tool.schema);
   const authorityModel = requireRecord(authority.model, 'Provider authority model');
   const provider = requireProviderKind(authorityModel.provider);
-  // Claude 轮内系统消息模式（本轮冻结的开关）：之前发过的提醒与重新注入的输入放回它那次请求的模型输出前面，本轮提醒
-  // 标为 current；发送形态由 claudeTurnScopedReminders.ts 决定。开关关闭时这里不产生任何标记，内容与原来完全一致。
+  // 提醒按来源 recipe 冻结的方式回到原来的输入位置；user 快照与 Claude 系统消息保持各自身份。
   const turnScopedReminders = provider === 'claude' && authorityModel.claudeTurnScopedReminders === true;
-  const reminderHistory = turnScopedReminders ? turnReminderHistoryBySegment(request) : undefined;
+  const reminderDelivery = recipeTurnReminderDelivery(recipe)
+    ?? (turnScopedReminders ? 'claude_turn_scoped' : undefined);
+  const reminderHistory = turnReminderHistoryBySegment(request);
   const historyInsertions: HistoryInsertion[] = [];
   const systemPromptPrefix = typeof authorityModel.systemPromptPrefix === 'string'
     ? authorityModel.systemPromptPrefix
@@ -914,6 +916,21 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
     { allowCurrentTurnDelta: currentTurnInput?.reinject === true }
   );
   const attachmentPlacements = createAttachmentPlacementQueue((content) => contents.push(content));
+  let lastResponseIdentity: string | undefined;
+  let readBoundary: number | undefined;
+  const observeOutput = (item: FullProviderContextItem, output: readonly MessageContent[]): void => {
+    if (provider !== 'openai-responses' || !item.sourceModelRequestId) return;
+    const model = output.find((content) => content.role === 'model');
+    if (!model) return;
+    const physicalId = model.parts.find((part) => 'outputItem' in part && part.outputItem?.providerResponseId);
+    const responseId = physicalId && 'outputItem' in physicalId
+      ? physicalId.outputItem!.providerResponseId : undefined;
+    const identity = JSON.stringify([item.sourceModelRequestId, responseId]);
+    if (identity !== lastResponseIdentity) {
+      lastResponseIdentity = identity;
+      readBoundary = contents.length;
+    }
+  };
   const appendAttachmentState = (segmentId: string, toolResults = false): void => {
     attachmentPlacements.leave(toolResults, renderedAttachmentState.afterSegment.get(segmentId));
   };
@@ -930,6 +947,9 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
       continue;
     }
     if (pairContents) {
+      const historical = reminderHistory.get(item.segmentId);
+      if (historical) historyInsertions.push(historyInsertion(historical, contents.length));
+      observeOutput(item, pairContents);
       contents.push(...pairContents);
       appendAttachmentState(item.segmentId, toolResults);
       continue;
@@ -956,12 +976,15 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
     if (decoded) {
       const historical = decoded.role === 'model' ? reminderHistory?.get(item.segmentId) : undefined;
       if (historical) historyInsertions.push(historyInsertion(historical, contents.length));
+      observeOutput(item, [decoded]);
       contents.push(isolateCrossSourceProviderState(decoded, item.modelSource, request, provider));
       appendAttachmentState(item.segmentId);
       continue;
     }
     const role = item.messageRole === 'model' ? 'model' : 'user';
-    contents.push({ role, parts: [{ text: item.content }] });
+    const content: MessageContent = { role, parts: [{ text: item.content }] };
+    observeOutput(item, [content]);
+    contents.push(content);
     appendAttachmentState(item.segmentId);
   }
   attachmentPlacements.release();
@@ -988,18 +1011,18 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
     tailInputIndex = contents.length;
     contents.push(reinjected);
   }
-  // 窗口里已有这条输入的历史副本：轮内系统消息模式下尾巴副本不再发送（尾巴模式照常发送）。
-  const supersededTailInputIndex = tailInputIndex !== undefined && historyInsertions.some((insertion) =>
-    insertion.input?.messageRevisionId === currentTurnInput?.messageRevisionId)
-    ? tailInputIndex
-    : undefined;
+  // 窗口里已有这条输入的历史副本，当前尾部按该副本的冻结方式省略。
+  const historicalInput = tailInputIndex === undefined ? undefined : historyInsertions.find((insertion) =>
+    insertion.input?.messageRevisionId === currentTurnInput?.messageRevisionId);
+  const supersededTailInput = historicalInput && tailInputIndex !== undefined
+    ? { index: tailInputIndex, delivery: historicalInput.delivery } : undefined;
   const turnReminder = request.requestAddenda?.turnReminder;
   if (turnReminder) {
     contents.push({ role: 'user', parts: [{ text: turnReminder.content }] });
   }
   const volatileTailContentKinds: NonNullable<
     LlmStartRequest['openAIResponsesContinuation']
-  >['volatileTailContentKinds'] = [
+  >['volatileTailContentKinds'] = reminderDelivery === 'user_history' ? [] : [
     ...(currentTurnInput?.reinject ? ['current_turn_input' as const] : []),
     ...(turnReminder ? ['turn_reminder' as const] : [])
   ];
@@ -1014,13 +1037,17 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
     projection.contents,
     contents.length,
     projection.insertions,
-    turnScopedReminders ? turnReminder : undefined,
-    supersededTailInputIndex
+    turnReminder && reminderDelivery ? { ...turnReminder, delivery: reminderDelivery } : undefined,
+    supersededTailInput
   );
   return {
     id: request.modelRequestId,
     conversationId: requireText(request.conversationId, 'Provider request conversationId'),
     contents: projectedContents,
+    ...(readBoundary === undefined ? {} : {
+      readBreakpointBeforeContentIndex: readBoundary + historyInsertions.reduce((count, insertion) =>
+        count + (insertion.beforeIndex <= readBoundary! ? Number(!!insertion.input) + Number(insertion.reminder !== undefined) : 0), 0)
+    }),
     tools,
     model: {
       providerConfigId: request.providerId,
@@ -1074,6 +1101,7 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
 interface HistoryInsertion {
   /** 那次请求的模型输出在投影前内容里的位置。 */
   beforeIndex: number;
+  delivery: TurnReminderDeliveryMode;
   reminder?: string;
   reminderIdentitySplit?: TurnReminderIdentitySplit;
   input?: { messageRevisionId: string; content: MessageContent };
@@ -1099,6 +1127,7 @@ function historyInsertion(entry: TurnReminderHistoryEntry, beforeIndex: number):
   }
   return {
     beforeIndex,
+    delivery: entry.delivery,
     ...(entry.content !== undefined ? { reminder: entry.content } : {}),
     ...(entry.content !== undefined && entry.identitySplit ? { reminderIdentitySplit: entry.identitySplit } : {}),
     ...(input ? { input } : {})
@@ -1164,20 +1193,20 @@ function cloneManagedMediaBodyProjectionState(state: ManagedMediaBodyProjectionS
 }
 
 /**
- * 把 Claude 轮内系统消息模式的标记放进已投影的内容：投影逐条一一对应（不增删、不重排），
+ * 把冻结发送方式的标记放进已投影的内容：投影逐条一一对应（不增删、不重排），
  * 历史内容按投影前记下的位置插回那次请求的模型输出前面（重新注入的输入在前、提醒在后，与那次请求尾巴的顺序相同），
  * 本轮提醒（投影前按原来的形态放在最后）换成带标记的同一文本；窗口里已有历史副本的尾巴输入标为 current。
- * 带运行状态卡的提醒把身份拆分放进标记，发送时运行状态卡保持 user 身份（见 claudeTurnScopedReminders.ts）。
+ * 带运行状态卡的提醒把身份拆分放进标记，发送时运行状态卡保持 user 身份（见 turnReminderLayout.ts）。
  * 历史提醒不参与投影，工具结果分组与媒体去重与开关关闭时完全相同。
  */
 function withTurnReminderMarkers(
   projected: MessageContent[],
   contentCount: number,
   insertions: readonly HistoryInsertion[],
-  currentReminder: { content: string; identitySplit?: TurnReminderIdentitySplit } | undefined,
-  supersededTailInputIndex?: number
+  currentReminder: { content: string; identitySplit?: TurnReminderIdentitySplit; delivery: TurnReminderDeliveryMode } | undefined,
+  supersededTailInput?: { index: number; delivery: TurnReminderDeliveryMode }
 ): MessageContent[] {
-  if (insertions.length === 0 && currentReminder === undefined && supersededTailInputIndex === undefined) return projected;
+  if (insertions.length === 0 && currentReminder === undefined && supersededTailInput === undefined) return projected;
   if (projected.length !== contentCount) {
     throw new Error('Ordinary Context projection must keep one projected content per input content.');
   }
@@ -1186,15 +1215,17 @@ function withTurnReminderMarkers(
   projected.forEach((content, index) => {
     while (cursor < insertions.length && insertions[cursor].beforeIndex === index) {
       const insertion = insertions[cursor++];
-      if (insertion.input) result.push(markedReinjectedInput(insertion.input.content, 'history'));
+      if (insertion.input) result.push(markedReinjectedInput(insertion.input.content, 'history', insertion.delivery));
       if (insertion.reminder !== undefined) {
         result.push(turnReminderContent(insertion.reminder, {
           placement: 'history',
+          delivery: insertion.delivery,
           ...(insertion.reminderIdentitySplit ? { identitySplit: insertion.reminderIdentitySplit } : {})
         }));
       }
     }
-    result.push(index === supersededTailInputIndex ? markedReinjectedInput(content, 'current') : content);
+    result.push(index === supersededTailInput?.index
+      ? markedReinjectedInput(content, 'current', supersededTailInput.delivery) : content);
   });
   if (cursor !== insertions.length) throw new Error('Historical turn reminder lost its model output position.');
   if (currentReminder !== undefined) {
@@ -1203,6 +1234,7 @@ function withTurnReminderMarkers(
     if (text !== currentReminder.content) throw new Error('The current turn reminder must be the last projected content.');
     result.push(turnReminderContent(currentReminder.content, {
       placement: 'current',
+      delivery: currentReminder.delivery,
       ...(currentReminder.identitySplit ? { identitySplit: currentReminder.identitySplit } : {})
     }));
   }
@@ -1575,9 +1607,8 @@ function compressionContext(
     && (methodKind !== 'provider_native' || recipe.sourceReplay === 'immutable_provenance')
     ? request.compressionSourceContext
     : request.context.slice(0, typeof recipe.sourceSegmentCount === 'number' ? recipe.sourceSegmentCount : request.context.length);
-  // Claude 原生压缩按对话原样发送（见 claudeTurnScopedCompaction）：普通请求放回的历史提醒与重新注入的输入，
-  // 在这里放到同样的位置，按同样的规则投影与标记；发送形态仍由 claudeTurnScopedReminders.ts 决定。
-  const reminderHistory = claudeTurnScopedCompaction(request.authoritySnapshot, recipe)
+  // 原生压缩重放实际可见窗口：历史提醒与重注入输入放回原位，发送方式由来源标记决定。
+  const reminderHistory = reminderHistoryForRequest(recipe)
     ? turnReminderHistoryBySegment(request)
     : undefined;
   const historyInsertions: HistoryInsertion[] = [];
@@ -1649,7 +1680,11 @@ function compressionContext(
       continue;
     }
     let decoded: MessageContent[];
-    if (pairContents) decoded = pairContents;
+    if (pairContents) {
+      const historical = reminderHistory?.get(item.segmentId);
+      if (historical) historyInsertions.push(historyInsertion(historical, contents.length));
+      decoded = pairContents;
+    }
     else if (item.segmentKind === 'runtime_context') {
       decoded = [runtimeContextContent(item.content, item.contentType, modelHandleCatalog)];
     }

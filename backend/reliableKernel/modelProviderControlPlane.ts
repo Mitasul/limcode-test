@@ -40,8 +40,11 @@ import {
   claudeTurnScopedRemindersEnabled,
   projectTurnReminder,
   recipeReinjectedCurrentTurnInput,
-  recipeSentClaudeTurnScopedReminders,
+  recipeTurnReminderDelivery,
+  reminderHistoryForRequest,
+  USER_HISTORY_REMINDER_DELIVERY,
   type ReinjectedCurrentTurnInputReference,
+  type TurnReminderDeliveryMode,
   type TurnReminderIdentitySplit
 } from './turnReminderProjection';
 import { modelHandleRef, prepareModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
@@ -138,6 +141,8 @@ export interface FullProviderContextItem {
   segmentKind: string;
   messageRole: string | null;
   modelSource?: ContextModelSource;
+  sourceRecipeObjectId?: string;
+  sourceModelRequestId?: string;
   contentType: string;
   content: string;
 }
@@ -196,13 +201,13 @@ export interface FullProviderRequest {
       runningProcessCount: number;
     };
     /**
-     * Claude 轮内系统消息模式（本轮冻结开关打开）才有：之前每次请求发过、之后仍要原样放回的内容，按那次请求冻结的
+     * 之前每次请求发过、之后仍要原样放回的内容，按那次请求冻结的
      * recipe 逐字节重新生成，挂在那次请求模型输出所在的 Context 片段上，发送时放回它的前面。
      * - content：那次请求的提醒；
      * - reinjectedInput：那次请求作为易失尾巴重新注入的当前 Turn 输入。同一窗口里同一条输入只在第一次出现时带上：
      *   之后的请求看到它已在窗口里，尾巴不再重发，因此也就没有要放回的副本。
-     * 没有模型输出进入 Context 的请求（失败、取消）不会出现在这里；recipe 没记着按轮内方式发出的请求（开关打开之前以尾巴
-     * 方式发出的）也不会：那份提醒当时只是尾巴。普通请求与同渠道同模型的 Claude 原生压缩请求才有。
+     * 没有模型输出进入 Context 的请求（失败、取消）不会出现在这里；未冻结历史发送方式的请求也不会。
+     * Responses user 快照在普通请求与原生压缩中保持 user；Claude 轮内系统消息按其既有开关与同模型压缩规则重放。
      */
     turnReminderHistory?: TurnReminderHistoryEntry[];
   };
@@ -210,6 +215,7 @@ export interface FullProviderRequest {
 
 export interface TurnReminderHistoryEntry {
   segmentId: string;
+  delivery: TurnReminderDeliveryMode;
   content?: string;
   /** 那次请求提醒的身份拆分（有运行状态卡时）；与那次请求发出时相同。 */
   identitySplit?: TurnReminderIdentitySplit;
@@ -224,6 +230,7 @@ export interface TurnReminderHistoryEntry {
 
 /** 一次历史请求要原样放回的内容，只取决于它不可变的 recipe。 */
 interface HistoricalRequestFacts {
+  readonly delivery: TurnReminderDeliveryMode;
   readonly reminder?: string;
   readonly reminderIdentitySplit?: Readonly<TurnReminderIdentitySplit>;
   // The renderer produces one user text part. Keep only that immutable scalar in the cache,
@@ -1004,6 +1011,8 @@ export class ModelProviderControlPlane {
       segmentKind: segment.segmentKind,
       messageRole: segment.messageRole,
       ...(segment.modelSource ? { modelSource: segment.modelSource } : {}),
+      ...(segment.sourceRecipeObjectId ? { sourceRecipeObjectId: segment.sourceRecipeObjectId } : {}),
+      ...(segment.sourceModelRequestId ? { sourceModelRequestId: segment.sourceModelRequestId } : {}),
       contentType: segment.contentObject.content_type,
       content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
     }));
@@ -1104,6 +1113,8 @@ export class ModelProviderControlPlane {
       segmentKind: segment.segmentKind,
       messageRole: segment.messageRole,
       ...(segment.modelSource ? { modelSource: segment.modelSource } : {}),
+      ...(segment.sourceRecipeObjectId ? { sourceRecipeObjectId: segment.sourceRecipeObjectId } : {}),
+      ...(segment.sourceModelRequestId ? { sourceModelRequestId: segment.sourceModelRequestId } : {}),
       contentType: segment.contentObject.content_type,
       content: decodeUtf8Exact(segment.content, `ContextSegment ${segment.segmentId}`)
     }));
@@ -2903,8 +2914,8 @@ export class ModelProviderControlPlane {
   }
 
   /**
-   * Claude 轮内系统消息模式下，之前每次请求发过、之后仍要原样放回的内容（见 FullProviderRequest.requestAddenda.turnReminderHistory）。
-   * 每条模型输出片段经 ModelRequestMessageLink 找到产生它的 ModelRequest，再从它冻结的 recipe 重新生成：提醒用同一个
+   * 之前每次请求发过、之后仍要原样放回的内容（见 FullProviderRequest.requestAddenda.turnReminderHistory）。
+   * 当前窗口的真实模型输出片段已关联所属 ModelRequest，再从它冻结的 recipe 重新生成：提醒用同一个
    * projectTurnReminder，重新注入的输入读 recipe 冻结的那条输入与附件目录增量。重试共用一个 ModelRequest，恢复与重启只读
    * 持久事实，fork 复制的请求共用同一个 recipe 对象，压缩掉的片段不在 Context 里；没有模型输出进入 Context 的请求不会被找到。
    *
@@ -2916,11 +2927,11 @@ export class ModelProviderControlPlane {
     recipe: PlainJsonValue,
     segments: readonly MaterializedContextSegment[]
   ): Promise<TurnReminderHistoryEntry[] | undefined> {
-    const ordinary = isRecord(recipe) && recipe.kind === 'reliable-agent-turn' && claudeTurnScopedRemindersEnabled(authority);
-    if (!ordinary && !claudeTurnScopedCompaction(authority, recipe)) return undefined;
-    let sources = segments.filter((segment) => segment.segmentKind === 'message'
-      && segment.messageRole === 'model'
-      && typeof segment.sourceRecipeObjectId === 'string');
+    if (!reminderHistoryForRequest(recipe)) return undefined;
+    const replayClaude = isRecord(recipe) && recipe.kind === 'reliable-agent-turn'
+      ? claudeTurnScopedRemindersEnabled(authority)
+      : claudeTurnScopedCompaction(authority, recipe);
+    let sources = segments.filter((segment) => typeof segment.sourceRecipeObjectId === 'string');
     if (sources.length === 0) return undefined;
     sources = await this.filterHistoricalReminderSources(sources);
     if (sources.length === 0) return undefined;
@@ -2948,15 +2959,20 @@ export class ModelProviderControlPlane {
       }
     }
     const placedInputs = new Set<string>();
+    const placedRecipes = new Set<string>();
     const planned: Array<{
       segmentId: string;
+      delivery: TurnReminderDeliveryMode;
       reminder?: string;
       reminderIdentitySplit?: TurnReminderIdentitySplit;
       input?: HistoricalRequestFacts['reinjectedInput'];
     }> = [];
     for (const segment of sources) {
-      const historical = facts.get(segment.sourceRecipeObjectId as string);
-      if (!historical) continue;
+      const recipeId = segment.sourceRecipeObjectId as string;
+      if (placedRecipes.has(recipeId)) continue;
+      placedRecipes.add(recipeId);
+      const historical = facts.get(recipeId);
+      if (!historical || (historical.delivery !== USER_HISTORY_REMINDER_DELIVERY && !replayClaude)) continue;
       const input = historical.reinjectedInput && !placedInputs.has(historical.reinjectedInput.messageRevisionId)
         ? historical.reinjectedInput
         : undefined;
@@ -2964,6 +2980,7 @@ export class ModelProviderControlPlane {
       if (historical.reminder === undefined && !input) continue;
       planned.push({
         segmentId: segment.segmentId,
+        delivery: historical.delivery,
         ...(historical.reminder !== undefined ? { reminder: historical.reminder } : {}),
         ...(historical.reminderIdentitySplit ? { reminderIdentitySplit: historical.reminderIdentitySplit } : {}),
         ...(input ? { input } : {})
@@ -2986,6 +3003,7 @@ export class ModelProviderControlPlane {
       const input = entry.input ? inputs.get(entry.input.contentObjectId) : undefined;
       return {
         segmentId: entry.segmentId,
+        delivery: entry.delivery,
         ...(entry.reminder !== undefined ? { content: entry.reminder } : {}),
         ...(entry.reminderIdentitySplit ? { identitySplit: { ...entry.reminderIdentitySplit } } : {}),
         ...(entry.input && input
@@ -3548,7 +3566,8 @@ function historicalReminderAuthorityCanSkip(bytes: Buffer): boolean {
   if (!isRecord(authority) || !isRecord(authority.model)) return false;
   const provider = canonicalLlmProviderKind(authority.model.provider);
   if (!provider) return false;
-  return provider !== 'claude' || authority.model.claudeTurnScopedReminders === false;
+  return provider !== 'openai-responses'
+    && (provider !== 'claude' || authority.model.claudeTurnScopedReminders === false);
 }
 
 function historicalReminderAuthorityKey(source: ContextReminderAuthoritySource): string {
@@ -3584,7 +3603,7 @@ class HistoricalReminderEligibilityCache {
 /**
  * Owned by one ModelProviderControlPlane: the database/store lifetime and immutable recipe CAS
  * identity are unchanged. Cache only projected scalar facts, never recipes, catalogs, source
- * membership or current authority. Source membership and Claude eligibility are checked per call.
+ * membership or current authority. Source membership and delivery eligibility are checked per call.
  * The budget counts UTF-16 scalar lengths plus fixed envelope/key/Map overhead, not exact V8 heap.
  * A count cap made even tiny negative facts re-read fat recipes on every >4096-producer scan.
  */
@@ -3629,7 +3648,7 @@ class HistoricalTurnReminderCache {
 
 /**
  * JSON syntax and verified CAS identity still apply to every historical recipe. Only a recipe
- * frozen as Claude turn-scoped can contribute reminder facts. Do not recursively normalize an
+ * frozen with historical reminder delivery can contribute reminder facts. Do not recursively normalize an
  * unrelated legacy recipe's tools/handle catalog merely to establish this negative result.
  * Positive candidates retain the existing full normalization and consumed-field validation.
  */
@@ -3638,7 +3657,7 @@ function parseHistoricalRequestFacts(bytes: Buffer, recipeObjectId: string): His
   let recipe: PlainJsonValue;
   try {
     const parsed: PlainJsonValue = JSON.parse(bytes.toString('utf8'));
-    if (!isRecord(parsed) || !recipeSentClaudeTurnScopedReminders(parsed)) return null;
+    if (!isRecord(parsed) || !recipeTurnReminderDelivery(parsed)) return null;
     recipe = normalizePlainJson(parsed, label);
   } catch (error) {
     throw new Error(`${label} is not valid plain JSON: ${error instanceof Error ? error.message : String(error)}`);
@@ -3649,10 +3668,11 @@ function parseHistoricalRequestFacts(bytes: Buffer, recipeObjectId: string): His
 /**
  * 一次历史请求要原样放回的内容：它的提醒，以及它作为易失尾巴重新注入的当前 Turn 输入（连同那次一起渲染的
  * current_turn_delta 附件目录，用那次 recipe 冻结的附件目录与模型句柄，与当时 llmCapabilityProviderAdapter 渲染的逐字节相同）。
- * 只有 recipe 记着当时就按轮内系统消息发出的请求才有：以尾巴方式发出的提醒与输入副本只在那次请求里出现过，不补回历史。
+ * 只有 recipe 记着当时就保留历史的请求才有：易失尾巴方式的提醒与输入副本不补回历史。
  */
 function historicalRequestFacts(recipe: PlainJsonValue, recipeObjectId: string): HistoricalRequestFacts | null {
-  if (!recipeSentClaudeTurnScopedReminders(recipe)) return null;
+  const delivery = recipeTurnReminderDelivery(recipe);
+  if (!delivery) return null;
   const projected = projectTurnReminder(recipe);
   const reminder = projected?.content;
   const input = recipeReinjectedCurrentTurnInput(recipe);
@@ -3679,6 +3699,7 @@ function historicalRequestFacts(recipe: PlainJsonValue, recipeObjectId: string):
     }
   }
   return Object.freeze({
+    delivery,
     ...(reminder !== undefined ? { reminder } : {}),
     ...(projected?.identitySplit ? { reminderIdentitySplit: Object.freeze({ ...projected.identitySplit }) } : {}),
     ...(input ? { reinjectedInput: Object.freeze({ ...input,

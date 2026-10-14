@@ -50,7 +50,6 @@ export type OpenAIResponsesWebSocketPhaseKind =
 export interface OpenAIResponsesWebSocketPhase {
   phase: OpenAIResponsesWebSocketPhaseKind;
   observedAt: number;
-  sessionKeyHash: string;
   connectionGeneration: number;
   elapsedMs?: number;
   connectionReused?: boolean;
@@ -65,7 +64,6 @@ export interface OpenAIResponsesWebSocketPhase {
 
 /** Minimal phase-observation identity; sessions and multiplexed lanes both satisfy it. */
 export interface OpenAIResponsesWebSocketPhaseSource {
-  key: string;
   connectionGeneration: number;
 }
 
@@ -80,7 +78,6 @@ export function observeOpenAIResponsesWebSocketPhase(
     ...detail,
     phase,
     observedAt: Date.now(),
-    sessionKeyHash: createHash('sha256').update(source.key).digest('hex').slice(0, 12),
     connectionGeneration: detail.connectionGeneration ?? source.connectionGeneration
   };
   try {

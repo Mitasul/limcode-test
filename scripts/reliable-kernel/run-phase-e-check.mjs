@@ -2382,7 +2382,9 @@ async function checkProviderFullRequest() {
     }
     assert.match(providerSource, /phase:\s*['"]continuation_decision['"]/);
     assert.match(productRuntimeSource, /eventKind:\s*['"]provider\.transport\.phase['"]/);
-    assert.match(productRuntimeSource, /sessionKeyHash/);
+    assert.match(productRuntimeSource, /conversationId:\s*trace\.conversationId/);
+    assert.match(productRuntimeSource, /modelRequestId:\s*trace\.requestId/);
+    assert.match(productRuntimeSource, /connectionGeneration:\s*trace\.connectionGeneration/);
     assert.doesNotMatch(productRuntimeSource.match(/onTransportTrace:[\s\S]*?resolveAttachment:/)?.[0] ?? '', /headers|prompt|arguments|toolResult/);
     const websocketSettings = {
       id: 'provider-session-scope',

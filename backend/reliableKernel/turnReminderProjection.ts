@@ -4,7 +4,7 @@ import type { PlainJsonValue } from './plainJson';
  * 每轮提醒（任务卡、未完成任务检查、运行状态卡）的唯一生成入口。
  *
  * 本请求的提醒和历史提醒都只从各自 ModelRequest 冻结的 recipe 经过这里生成：recipe 是不可变的
- * 内容寻址对象，同一个 recipe 永远得到逐字节相同的文本。Claude 轮内系统消息模式要求历史提醒原样重发
+ * 内容寻址对象，同一个 recipe 永远得到逐字节相同的文本。Responses 历史快照和 Claude 轮内系统消息都原位原样重发；Claude 要求
  * （https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages
  * “Re-send cleared messages verbatim”），所以这里的取值与拼接格式是持久契约：改动它会改变所有历史提醒的
  * 重发文本（一次性缓存失效、保留思考失效），必须同时更新固定格式的测试。
@@ -51,7 +51,9 @@ export function projectTurnReminder(recipe: PlainJsonValue | undefined): TurnRem
   const reminderParts = statusCard ? [...systemParts, statusCard] : systemParts;
   if (reminderParts.length === 0) return undefined;
   return {
-    content: reminderParts.join('\n\n'),
+    content: (recipe.turnReminderDelivery === USER_HISTORY_REMINDER_DELIVERY
+      ? [USER_HISTORY_REMINDER_SNAPSHOT_NOTICE, ...reminderParts]
+      : reminderParts).join('\n\n'),
     ...(statusCard
       ? { identitySplit: { user: statusCard, ...(systemParts.length ? { system: systemParts.join('\n\n') } : {}) } }
       : {}),
@@ -84,14 +86,40 @@ export function recipeReinjectedCurrentTurnInput(
 }
 
 /**
- * 普通请求 recipe 记下的每轮提醒发送方式（`recipe.turnReminderDelivery`）：冻结这次请求时开关打开，提醒按 Claude
- * 轮内系统消息发出。之后的请求只为这样的请求原样重建提醒与重新注入的输入；没有这个字段的请求当时以尾巴方式发出，
- * 那份提醒只在它自己那次请求里出现过，中途打开开关也不会把它补回历史（前缀从打开那一刻起重新开始，缓存失效一次）。
+ * 普通请求 recipe 记下的发送方式：Responses 的 user 历史快照，或 Claude 轮内系统消息。
+ * 之后的请求按这个事实重建提醒与重新注入的输入；没有字段的请求当时以易失尾巴发出，保留它原来的发送语义。
  */
 export const CLAUDE_TURN_SCOPED_REMINDER_DELIVERY = 'claude_turn_scoped' as const;
+export const USER_HISTORY_REMINDER_DELIVERY = 'user_history' as const;
+export type TurnReminderDeliveryMode = typeof CLAUDE_TURN_SCOPED_REMINDER_DELIVERY | typeof USER_HISTORY_REMINDER_DELIVERY;
 
-export function recipeSentClaudeTurnScopedReminders(recipe: PlainJsonValue | undefined): boolean {
-  return isRecord(recipe) && recipe.turnReminderDelivery === CLAUDE_TURN_SCOPED_REMINDER_DELIVERY;
+const USER_HISTORY_REMINDER_SNAPSHOT_NOTICE = '[Runtime snapshot before the next assistant response]\n'
+  + 'These facts describe the state before the assistant response immediately following this message. '
+  + 'In later responses this is historical evidence; use newer runtime observations and tool results for current state.';
+
+/** 请求首次冻结的发送事实；没有标记的旧请求保留原来的易失尾巴语义。 */
+export function recipeTurnReminderDelivery(recipe: PlainJsonValue | undefined): TurnReminderDeliveryMode | undefined {
+  if (!isRecord(recipe)) return undefined;
+  return recipe.turnReminderDelivery === USER_HISTORY_REMINDER_DELIVERY
+    || recipe.turnReminderDelivery === CLAUDE_TURN_SCOPED_REMINDER_DELIVERY
+    ? recipe.turnReminderDelivery
+    : undefined;
+}
+
+/** Responses 始终保留已发送的 user 快照；Claude 的发送方式沿用它冻结的轮内系统消息开关。 */
+export function requestTurnReminderDelivery(authority: PlainJsonValue | undefined): TurnReminderDeliveryMode | undefined {
+  const model = isRecord(authority) && isRecord(authority.model) ? authority.model : undefined;
+  if (model?.provider === 'openai-responses') return USER_HISTORY_REMINDER_DELIVERY;
+  return claudeTurnScopedRemindersEnabled(authority) ? CLAUDE_TURN_SCOPED_REMINDER_DELIVERY : undefined;
+}
+
+/** 普通请求及原生压缩都投影已保留的 user 快照；文本摘要只读取语义 Context。 */
+export function reminderHistoryForRequest(recipe: PlainJsonValue | undefined): boolean {
+  if (!isRecord(recipe)) return false;
+  return recipe.kind === 'reliable-agent-turn'
+    || (recipe.kind === 'reliable-context-compression'
+      && recipe.compressionMethodKind === 'provider_native'
+      && recipe.sourceReplay === undefined);
 }
 
 /**

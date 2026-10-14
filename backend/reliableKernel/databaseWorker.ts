@@ -9,6 +9,8 @@ import { allocateTimelinePosition, allocateHistoricalTimelineImport, timelineImp
 import { AttachmentProjectionScopeCache, readAttachmentScopeSnapshot } from './attachmentProjectionScopeCache';
 import { readAttachmentProjectionSegments, readAttachmentProjectionLinks } from './attachmentProjectionSnapshot';
 import { executeContextSequenceNodeBatch } from './contextSequenceNodeBatch';
+import { originalNativeMessageRevisionId, nativeMessageRevisionItemKey } from './contextNativeMessageProvenance';
+import { nativeItemRevisionId } from './turnOutput';
 import * as fs from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import * as path from 'node:path';
@@ -501,8 +503,9 @@ async function start(): Promise<void> {
       }
       if (request.kind === 'contextContentMaterialization') {
         assertDatabaseBinding(reader, data.binding);
-        const structure = executeContextMaterialization(reader, request.rootId, commitSeq);
-        const attached = attachContextContent(structure, casByteAccess, contextCasCache);
+        const content = { cache: contextCasCache, bytes: new Map<string, Buffer>() };
+        const structure = executeContextMaterialization(reader, request.rootId, commitSeq, content);
+        const attached = attachContextContent(structure, content.bytes);
         respond({ type: 'response', id: request.id, ok: true, result: attached.result }, attached.transferList);
         return;
       }
@@ -2624,10 +2627,16 @@ function whereClause(encoded: EncodedRow): { predicates: string[]; parameters: E
   return { predicates, parameters };
 }
 
+interface ContextMaterializationContent {
+  cache: VerifiedContextCasCache;
+  bytes: Map<string, Buffer>;
+}
+
 function executeContextMaterialization(
   database: Database.Database,
   rootId: string,
-  commitSeq: bigint
+  commitSeq: bigint,
+  content?: ContextMaterializationContent
 ): SnapshotBarrier<ContextMaterializationSnapshot> {
   const normalizedRootId = requireRuntimeId(rootId);
   database.exec('BEGIN');
@@ -2641,35 +2650,37 @@ function executeContextMaterialization(
     const tailNodeId = nullableRuntimeId(root.tail_node_id, 'ContextSequenceRoot.tail_node_id');
     const tailCount = nonNegativeSafeInteger(root.tail_segment_count, 'ContextSequenceRoot.tail_segment_count');
     const segmentCount = nonNegativeSafeInteger(root.segment_count, 'ContextSequenceRoot.segment_count');
-    let records: ContextMaterializationRecord[] = [];
+    let rows: Array<Record<string, unknown>> = [];
     if (rootNodeId === null) {
       if (tailNodeId !== null || tailCount !== 0 || segmentCount !== 0) {
         throw new Error(`ContextSequenceRoot ${normalizedRootId} has an invalid empty shape.`);
       }
     } else {
-      const rootRecord = readContextRecord(database, rootNodeId, conversationId);
-      if (rootRecord.segment.segment_kind === 'compression') {
-        if (rootRecord.node.parent_node_id !== null) {
+      const rootRecord = readContextRecord(database, rootNodeId);
+      if (rootRecord.segment_kind === 'compression') {
+        if (rootRecord.node_parent_node_id !== null) {
           throw new Error(`Compression root ${normalizedRootId} summary node must not have a parent.`);
         }
         if ((tailCount === 0) !== (tailNodeId === null)) {
           throw new Error(`Compression root ${normalizedRootId} tail pointer/count mismatch.`);
         }
-        const tail = tailNodeId === null ? [] : readContextChain(database, tailNodeId, tailCount, conversationId);
-        records = [rootRecord, ...tail];
-        if (records.length !== segmentCount) {
+        const tail = tailNodeId === null ? [] : readContextChain(database, tailNodeId, tailCount);
+        rows = [rootRecord, ...tail];
+        if (rows.length !== segmentCount) {
           throw new Error(`Compression root ${normalizedRootId} segment_count mismatch.`);
         }
       } else {
         if (tailNodeId !== null || tailCount !== 0) {
           throw new Error(`Ordinary root ${normalizedRootId} must not carry a compression tail.`);
         }
-        records = readContextChain(database, rootNodeId, segmentCount, conversationId);
-        if (records[0]?.node.parent_node_id !== null) {
+        rows = readContextChain(database, rootNodeId, segmentCount);
+        if (rows[0]?.node_parent_node_id !== null) {
           throw new Error(`Ordinary root ${normalizedRootId} chain does not terminate at NULL.`);
         }
       }
     }
+    if (content) collectContextContent(rows.map(contextRecordContentMetadata), content, casByteAccess);
+    const records = decodeContextRecords(database, rows, conversationId, content);
     database.exec('COMMIT');
     return { snapshotCommitSeq: commitSeq.toString(), snapshot: { root, records } };
   } catch (error) {
@@ -2678,36 +2689,38 @@ function executeContextMaterialization(
   }
 }
 
+function collectContextContent(
+  metadata: readonly DomainRow[],
+  content: ContextMaterializationContent,
+  access: SynchronousCasByteAccess
+): void {
+  const { bytes: unique, cache } = content;
+  // A chronological scan larger than either LRU budget otherwise evicts each next hit before
+  // reaching it. Retain this request's existing verified hits before admitting any misses. These
+  // buffers already belong in the request-local materialization; the persistent budgets stay fixed.
+  for (const object of metadata) {
+    const id = requireRuntimeId(object.id);
+    if (unique.has(id)) continue;
+    const cached = cache.readCached(object);
+    if (cached !== undefined) unique.set(id, cached);
+  }
+  for (const object of metadata) {
+    const id = requireRuntimeId(object.id);
+    if (unique.has(id)) continue;
+    unique.set(id, cache.read(object, access));
+  }
+}
+
 function attachContextContent(
   barrier: SnapshotBarrier<ContextMaterializationSnapshot>,
-  access: SynchronousCasByteAccess,
-  cache: VerifiedContextCasCache
+  unique: ReadonlyMap<string, Buffer>
 ): {
   result: SnapshotBarrier<ContextContentMaterializationSnapshot>;
   transferList: ArrayBuffer[];
 } {
-  const unique = new Map<string, Buffer>();
-  // A chronological scan larger than either LRU budget otherwise evicts each next hit before
-  // reaching it. Retain this request's existing verified hits before admitting any misses. These
-  // buffers already belong in the request-local materialization; the persistent budgets stay fixed.
-  for (const record of barrier.snapshot.records) {
-    const metadata = record.contentObject;
-    const id = requireRuntimeId(metadata.id);
-    if (unique.has(id)) continue;
-    const cached = cache.readCached(metadata);
-    if (cached !== undefined) unique.set(id, cached);
-  }
   let totalBytes = 0;
   for (const bytes of unique.values()) totalBytes += bytes.length;
-  for (const record of barrier.snapshot.records) {
-    const metadata = record.contentObject;
-    const id = requireRuntimeId(metadata.id);
-    if (unique.has(id)) continue;
-    const bytes = cache.read(metadata, access);
-    totalBytes += bytes.length;
-    if (!Number.isSafeInteger(totalBytes)) throw new RangeError('Materialized Context bytes exceed the safe packed-buffer range.');
-    unique.set(id, bytes);
-  }
+  if (!Number.isSafeInteger(totalBytes)) throw new RangeError('Materialized Context bytes exceed the safe packed-buffer range.');
   const packed = new Uint8Array(totalBytes);
   const views = new Map<string, Uint8Array>();
   let offset = 0;
@@ -2754,9 +2767,8 @@ function assertSameContextCasIdentity(
 function readContextChain(
   database: Database.Database,
   startNodeId: string,
-  count: number,
-  conversationId: string
-): ContextMaterializationRecord[] {
+  count: number
+): Array<Record<string, unknown>> {
   if (count <= 0) throw new Error('Context chain with a start node requires a positive segment count.');
   const rows = prepareCached(database, `
     WITH RECURSIVE chain(id, parent_node_id, segment_id, created_at, depth) AS (
@@ -2790,10 +2802,10 @@ function readContextChain(
      ORDER BY chain.depth DESC
   `).all({ startNodeId, segmentCount: BigInt(count) }) as Array<Record<string, unknown>>;
   if (rows.length !== count) throw new Error(`Context chain expected ${count} nodes, found ${rows.length}.`);
-  return decodeContextRecords(database, rows, conversationId);
+  return rows;
 }
 
-function readContextRecord(database: Database.Database, nodeId: string, conversationId: string): ContextMaterializationRecord {
+function readContextRecord(database: Database.Database, nodeId: string): Record<string, unknown> {
   const row = prepareCached(database, `
     SELECT node.id AS node_id,
            node.parent_node_id AS node_parent_node_id,
@@ -2816,37 +2828,45 @@ function readContextRecord(database: Database.Database, nodeId: string, conversa
      WHERE node.id = ?
   `).get(nodeId) as Record<string, unknown> | undefined;
   if (!row) throw new Error(`ContextSequenceNode ${nodeId} does not exist or has missing content.`);
-  return decodeContextRecords(database, [row], conversationId)[0];
+  return row;
 }
 
 function decodeContextRecords(
   database: Database.Database,
   rows: Array<Record<string, unknown>>,
-  conversationId: string
+  conversationId: string,
+  content?: ContextMaterializationContent
 ): ContextMaterializationRecord[] {
-  const messageSegmentIds = rows
-    .filter((row) => row.segment_kind === 'message')
+  // Structure readers select immutable metadata only. Native item proof belongs to content
+  // materialization, which already reads these exact bytes for the model-visible projection.
+  const producerSegmentIds = rows
+    .filter((row) => row.segment_kind === 'message' || (content && row.segment_kind === 'tool_pair'))
     .map((row) => requireRuntimeId(row.segment_id));
+  const rowsBySegment = new Map(rows.map(row => [requireRuntimeId(row.segment_id), row]));
   const roles = new Map<string, string[]>();
   const modelSources = new Map<string, ContextModelSource | null>();
   // Producer metadata belongs to this immutable root's Conversation. Shared segments keep
   // ancestor revisions after deletion; their orphaned links are not evidence against a live copy.
   // Disagreement or an unlinked source within the selected Conversation still leaves it unset.
   const recipeSources = new Map<string, string | null>();
+  const requestSources = new Map<string, string | null>();
   const reminderAuthorities = new Map<string, ContextReminderAuthoritySource | null>();
+  const copiedOrigins = new Map<string, { turnId: string; round: string } | null>();
   // Claude 保留思考处理：产生这条模型输出的请求终态里记下的对话选择；多个来源取更强的一种（只会单向推进）。
   const thinkingBindings = new Map<string, 'drop_block' | 'strip_thinking'>();
-  for (let offset = 0; offset < messageSegmentIds.length; offset += 500) {
-    const chunk = messageSegmentIds.slice(offset, offset + 500);
+  for (let offset = 0; offset < producerSegmentIds.length; offset += 500) {
+    const chunk = producerSegmentIds.slice(offset, offset + 500);
     const placeholders = chunk.map(() => '?').join(',');
-    // One placeholder per segment: every chunk length is another SQL text, so it is never cached.
+    // Each chunk length is another SQL text, so it is never cached.
     const sourceRows = prepareUncached(database, `
       SELECT DISTINCT source.segment_id AS segment_id, revision.role AS role,
+             revision.id AS revision_id, revision.revision_seq AS revision_seq,
              membership.conversation_id AS source_conversation_id,
              model_request.provider_id AS source_provider_id,
              model_request.model_id AS source_model_id,
              model_request.recipe_object_id AS source_recipe_object_id,
              model_request.id AS source_model_request_id,
+             model_request.turn_id AS source_turn_id,
              authority.id AS source_authority_snapshot_id,
              authority.content_object_id AS source_authority_content_id,
              model_request.stream_stats_json AS source_stream_stats_json
@@ -2854,12 +2874,15 @@ function decodeContextRecords(
         JOIN message_revision AS revision
           ON revision.id = source.source_id
          AND revision.revision_seq = source.source_revision
+        JOIN context_segment AS source_segment
+          ON source_segment.id = source.segment_id
+         AND source_segment.content_object_id = revision.content_object_id
         LEFT JOIN message_part_of_conversation AS membership
           ON membership.message_id = revision.message_id
         LEFT JOIN model_request_message_link AS model_link
           ON model_link.message_id = revision.message_id
-         AND revision.revision_seq = 1
          AND revision.role = 'model'
+         AND (revision.revision_seq = 1 OR ${content ? '1' : '0'})
         LEFT JOIN model_request
           ON model_request.id = model_link.model_request_id
          AND EXISTS (SELECT 1 FROM turn AS producer_turn
@@ -2870,31 +2893,91 @@ function decodeContextRecords(
          AND authority.turn_id = model_request.turn_id
        WHERE source.source_kind = 'message_revision'
          AND source.segment_id IN (${placeholders})
-       ORDER BY source.segment_id, source.id
-    `).all(...chunk) as Array<{
+      UNION ALL
+      SELECT DISTINCT source.segment_id, NULL AS role, NULL AS revision_id, NULL AS revision_seq,
+             call_turn.conversation_id,
+             model_request.provider_id, model_request.model_id, model_request.recipe_object_id,
+             model_request.id, model_request.turn_id,
+             authority.id, authority.content_object_id, model_request.stream_stats_json
+        FROM context_segment_source AS source
+        JOIN tool_call AS call ON call.id = source.source_id AND call.call_seq = source.source_revision
+        JOIN turn AS call_turn ON call_turn.id = call.turn_id
+        LEFT JOIN tool_call_source_link AS call_source ON call_source.tool_call_id = call.id
+        LEFT JOIN model_request ON model_request.id = call_source.model_request_id
+                               AND model_request.turn_id = call.turn_id
+        LEFT JOIN authority_snapshot AS authority ON authority.id = model_request.authority_snapshot_id
+                                                  AND authority.turn_id = model_request.turn_id
+       WHERE source.source_kind = 'tool_call'
+         AND ${content ? '1' : '0'}
+         AND source.segment_id IN (${placeholders})
+         AND NOT EXISTS (SELECT 1 FROM context_segment_source AS result_source
+                          WHERE result_source.segment_id = source.segment_id
+                            AND result_source.source_kind = 'tool_model_result')
+       ORDER BY segment_id
+    `).all(...chunk, ...chunk) as Array<{
       segment_id: string;
-      role: string;
+      role: string | null;
+      revision_id: string | null;
+      revision_seq: bigint | null;
       source_conversation_id: string | null;
       source_provider_id: string | null;
       source_model_id: string | null;
       source_recipe_object_id: string | null;
       source_model_request_id: string | null;
+      source_turn_id: string | null;
       source_authority_snapshot_id: string | null;
       source_authority_content_id: string | null;
       source_stream_stats_json: string | null;
     }>;
+    // Native revisions reuse the content-transfer cache. Only copied items need origin metadata,
+    // loaded as one selected batch when the first copied item is encountered.
+    const nativeSources = sourceRows.filter(source => source.source_conversation_id === conversationId
+      && source.role === 'model' && source.revision_seq !== 1n && source.source_model_request_id);
+    let frozenContent: Map<string, DomainRow> | undefined;
+    let nativeSelectors: Map<string, Set<string>> | undefined;
     for (const source of sourceRows) {
       const segmentId = requireRuntimeId(source.segment_id);
-      if (typeof source.role !== 'string' || source.role.length === 0) {
-        throw new Error(`Message ContextSegment ${segmentId} has an invalid role.`);
+      if (source.role !== null) {
+        if (source.role.length === 0) throw new Error(`Message ContextSegment ${segmentId} has an invalid role.`);
+        const current = roles.get(segmentId) ?? [];
+        if (!current.includes(source.role)) current.push(source.role);
+        roles.set(segmentId, current);
       }
-      const current = roles.get(segmentId) ?? [];
-      if (!current.includes(source.role)) current.push(source.role);
-      roles.set(segmentId, current);
       // Immutable roles remain available even when the root's original Conversation was deleted.
       // Provider state, recipes and reminder authorities require ownership in this root's scope.
       if (source.source_conversation_id !== conversationId) continue;
-      const modelSource = source.source_provider_id && source.source_model_id
+      let requestId = source.source_model_request_id;
+      if (content && requestId && source.role === 'model' && source.revision_seq !== 1n) {
+        const row = rowsBySegment.get(segmentId)!;
+        const bytes = content.bytes.get(requireRuntimeId(row.content_id))!;
+        const itemKey = nativeMessageRevisionItemKey(bytes.toString('utf8'));
+        let proven = !!itemKey && source.revision_id === nativeItemRevisionId(source.source_turn_id!, requestId, itemKey);
+        if (itemKey && !proven) {
+          let origin = copiedOrigins.get(requestId);
+          if (origin === undefined) {
+            if (!frozenContent) {
+              const ids = [...new Set(nativeSources.flatMap(candidate =>
+                [candidate.source_recipe_object_id, candidate.source_authority_content_id].filter((id): id is string => !!id)))];
+              frozenContent = readContextFrozenContentMetadata(database, ids);
+            }
+            const authorityMetadata = frozenContent.get(source.source_authority_content_id!);
+            const recipeMetadata = frozenContent.get(source.source_recipe_object_id!);
+            if (!authorityMetadata || !recipeMetadata) throw new Error('Native producer has missing frozen content.');
+            const authority = JSON.parse(content.cache.read(authorityMetadata, casByteAccess).toString('utf8')) as Record<string, unknown>;
+            const recipe = JSON.parse(content.cache.read(recipeMetadata, casByteAccess).toString('utf8')) as Record<string, unknown>;
+            origin = typeof authority.turnId === 'string' && typeof recipe.round === 'string'
+              ? { turnId: authority.turnId, round: recipe.round } : null;
+            copiedOrigins.set(requestId, origin);
+          }
+          if (origin) {
+            nativeSelectors ??= readContextMessageSelectors(database, chunk);
+            const originalRevisionId = originalNativeMessageRevisionId(origin.turnId, origin.round, itemKey);
+            proven = nativeSelectors.get(segmentId)?.has(`${originalRevisionId}\0${source.revision_seq}`) === true;
+          }
+        }
+        if (!proven) requestId = null; // User-edited revisions retain their Message link, but have no producer.
+      }
+      const modelSource = requestId && source.source_provider_id && source.source_model_id
         ? { providerId: source.source_provider_id, modelId: source.source_model_id }
         : null;
       const previousSource = modelSources.get(segmentId);
@@ -2904,14 +2987,17 @@ function decodeContextRecords(
         || previousSource.providerId !== modelSource.providerId
         || previousSource.modelId !== modelSource.modelId
       )) modelSources.set(segmentId, null);
-      const recipeObjectId = typeof source.source_recipe_object_id === 'string' && source.source_recipe_object_id
+      const previousRequest = requestSources.get(segmentId);
+      if (previousRequest === undefined) requestSources.set(segmentId, requestId);
+      else if (previousRequest !== requestId) requestSources.set(segmentId, null);
+      const recipeObjectId = requestId && typeof source.source_recipe_object_id === 'string' && source.source_recipe_object_id
         ? source.source_recipe_object_id
         : null;
       const previousRecipe = recipeSources.get(segmentId);
       if (previousRecipe === undefined) recipeSources.set(segmentId, recipeObjectId);
       else if (previousRecipe !== recipeObjectId) recipeSources.set(segmentId, null);
-      const reminderAuthority = source.source_model_request_id && source.source_authority_snapshot_id && source.source_authority_content_id
-        ? { modelRequestId: source.source_model_request_id, authoritySnapshotId: source.source_authority_snapshot_id,
+      const reminderAuthority = requestId && source.source_authority_snapshot_id && source.source_authority_content_id
+        ? { modelRequestId: requestId, authoritySnapshotId: source.source_authority_snapshot_id,
             contentObjectId: source.source_authority_content_id } : null;
       const previousAuthority = reminderAuthorities.get(segmentId);
       if (previousAuthority === undefined) reminderAuthorities.set(segmentId, reminderAuthority);
@@ -2919,10 +3005,11 @@ function decodeContextRecords(
         || previousAuthority.modelRequestId !== reminderAuthority.modelRequestId
         || previousAuthority.authoritySnapshotId !== reminderAuthority.authoritySnapshotId
         || previousAuthority.contentObjectId !== reminderAuthority.contentObjectId)) reminderAuthorities.set(segmentId, null);
-      const binding = sourceClaudeThinkingBinding(source.source_stream_stats_json);
+      const binding = requestId ? sourceClaudeThinkingBinding(source.source_stream_stats_json) : undefined;
       if (binding && thinkingBindings.get(segmentId) !== 'strip_thinking') thinkingBindings.set(segmentId, binding);
     }
   }
+  rowsBySegment.clear();
   // Both callers transfer a fresh, private array. Replace its rows as they are decoded so the
   // complete joined-row graph does not remain live alongside a separate decoded-record array.
   const records: Array<Record<string, unknown> | ContextMaterializationRecord> = rows;
@@ -2934,10 +3021,49 @@ function decodeContextRecords(
       modelSources.get(String(row.segment_id)),
       recipeSources.get(String(row.segment_id)),
       thinkingBindings.get(String(row.segment_id)),
-      reminderAuthorities.get(String(row.segment_id))
+      reminderAuthorities.get(String(row.segment_id)),
+      requestSources.get(String(row.segment_id))
     );
   }
   return records as ContextMaterializationRecord[];
+}
+
+function readContextFrozenContentMetadata(database: Database.Database, ids: readonly string[]): Map<string, DomainRow> {
+  const result = new Map<string, DomainRow>();
+  for (let offset = 0; offset < ids.length; offset += 500) {
+    const chunk = ids.slice(offset, offset + 500);
+    for (const metadata of prepareUncached(database,
+      `SELECT * FROM content_object WHERE id IN (${chunk.map(() => '?').join(',')})`).all(...chunk) as DomainRow[]) {
+      result.set(requireRuntimeId(metadata.id), metadata);
+    }
+  }
+  return result;
+}
+
+/** Immutable origin selectors survive source Conversation deletion and arbitrarily deep forks. */
+function readContextMessageSelectors(database: Database.Database, segmentIds: readonly string[]): Map<string, Set<string>> {
+  const rows = prepareUncached(database, `
+    SELECT segment_id, source_id, source_revision FROM context_segment_source
+     WHERE source_kind = 'message_revision' AND segment_id IN (${segmentIds.map(() => '?').join(',')})
+  `).all(...segmentIds) as Array<{ segment_id: string; source_id: string; source_revision: bigint }>;
+  const result = new Map<string, Set<string>>();
+  for (const source of rows) {
+    let selectors = result.get(source.segment_id);
+    if (!selectors) result.set(source.segment_id, selectors = new Set());
+    selectors.add(`${source.source_id}\0${source.source_revision}`);
+  }
+  return result;
+}
+
+function contextRecordContentMetadata(row: Record<string, unknown>): DomainRow {
+  return DOMAIN_REPOSITORIES.codec('ContentObject').decode({
+    id: row.content_id,
+    content_type: row.content_type,
+    sha256: row.content_sha256,
+    byte_length: row.content_byte_length,
+    storage_key: row.content_storage_key,
+    created_at: row.content_created_at
+  });
 }
 
 /** ModelRequest.stream_stats_json 里持久化的 Claude 保留思考处理；没有或形状不对时为空。 */
@@ -2962,7 +3088,8 @@ function decodeContextRecord(
   modelSource?: ContextModelSource | null,
   sourceRecipeObjectId?: string | null,
   sourceThinkingBinding?: 'drop_block' | 'strip_thinking',
-  sourceReminderAuthority?: ContextReminderAuthoritySource | null
+  sourceReminderAuthority?: ContextReminderAuthoritySource | null,
+  sourceModelRequestId?: string | null
 ): ContextMaterializationRecord {
   const segmentKind = typeof row.segment_kind === 'string' ? row.segment_kind : '';
   let messageRole: string | null = null;
@@ -2985,18 +3112,12 @@ function decodeContextRecord(
       segment_kind: row.segment_kind,
       created_at: row.segment_created_at
     }),
-    contentObject: DOMAIN_REPOSITORIES.codec('ContentObject').decode({
-      id: row.content_id,
-      content_type: row.content_type,
-      sha256: row.content_sha256,
-      byte_length: row.content_byte_length,
-      storage_key: row.content_storage_key,
-      created_at: row.content_created_at
-    }),
+    contentObject: contextRecordContentMetadata(row),
     messageRole,
     ...(modelSource ? { modelSource } : {}),
-    ...(messageRole === 'model' && sourceRecipeObjectId ? { sourceRecipeObjectId } : {}),
-    ...(messageRole === 'model' && sourceRecipeObjectId && sourceReminderAuthority ? { sourceReminderAuthority } : {}),
+    ...(sourceModelRequestId ? { sourceModelRequestId } : {}),
+    ...(sourceModelRequestId && sourceRecipeObjectId ? { sourceRecipeObjectId } : {}),
+    ...(sourceModelRequestId && sourceRecipeObjectId && sourceReminderAuthority ? { sourceReminderAuthority } : {}),
     ...(messageRole === 'model' && sourceThinkingBinding ? { sourceClaudeThinkingBinding: sourceThinkingBinding } : {})
   };
 }

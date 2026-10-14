@@ -1,4 +1,3 @@
-import { createHash } from 'crypto';
 import WebSocket, { type RawData } from 'ws';
 import { captureDebug, associateDebugCapture, debugCaptureSources } from '../reliableKernel/debugCapture/observer';
 import { observeToolAssembly, type DebugWebSocketObservation } from '../reliableKernel/debugCapture/webSocketObservation';
@@ -106,7 +105,6 @@ export interface LimCodeOpenAIResponsesStreamChunk extends LLMStreamChunk {
 }
 
 export interface OpenAIResponsesWebSocketDecision {
-  sessionKeyHash: string;
   connectionGeneration: number;
   connectionReused: boolean;
   connectionReason: OpenAIResponsesWebSocketConnectionReason;
@@ -332,7 +330,7 @@ async function* streamLocked(
   const fullBody = sanitizeResponsesCreateBody(options.body, preservesExplicitPromptCache(options.body));
   const prepared = prepareCreatePayload(
     session,
-    { key: session.key, connectionGeneration: session.connectionGeneration },
+    { connectionGeneration: session.connectionGeneration },
     fullBody,
     connection,
     options.format,
@@ -366,7 +364,6 @@ async function* streamLocked(
         return session.responseCreateSeq;
       },
       options.debugCapture ? { ...options.debugCapture, metadata: {
-        sessionKeyHash: prepared.decision.sessionKeyHash,
         connectionGeneration: session.connectionGeneration,
         transport: 'websocket'
       } } : undefined
@@ -715,7 +712,7 @@ function requireConnectionIdentity(session: WebSocketSession): string {
 
 function prepareCreatePayload(
   continuation: OpenAIResponsesWebSocketContinuationState,
-  identity: { key: string; connectionGeneration: number },
+  identity: { connectionGeneration: number },
   fullBody: Record<string, unknown>,
   connection: SocketAdmission,
   format: OpenAIResponsesFormatAdapter,
@@ -841,7 +838,6 @@ function prepareCreatePayload(
         }
       : {}),
     decision: {
-      sessionKeyHash: createHash('sha256').update(identity.key).digest('hex').slice(0, 12),
       connectionGeneration: identity.connectionGeneration,
       connectionReused,
       connectionReason: connection.reason,
@@ -1737,8 +1733,7 @@ async function* streamOpenAIResponsesNativeSession(
         ? {
             debug: {
               ...options.debugCapture,
-              metadata: { ...options.debugCapture.metadata,
-                sessionKeyHash: createHash('sha256').update(options.sessionKey).digest('hex').slice(0, 12), transport: 'websocket' }
+              metadata: { ...options.debugCapture.metadata, transport: 'websocket' }
             }
           }
         : {})
@@ -1788,7 +1783,6 @@ function createExclusiveNativeLease(
         ...options.debugCapture,
         metadata: {
           ...options.debugCapture.metadata,
-          sessionKeyHash: createHash('sha256').update(session.key).digest('hex').slice(0, 12),
           connectionGeneration: session.connectionGeneration,
           transport: 'websocket'
         }
@@ -1923,7 +1917,7 @@ async function* runNativeChain(
   timeouts: OpenAIResponsesWebSocketTimeouts
 ): AsyncGenerator<LimCodeOpenAIResponsesStreamChunk> {
   const fullBody = sanitizeResponsesCreateBody(options.body, true);
-  const identity = { key: options.sessionKey, connectionGeneration: lease.connectionGeneration };
+  const identity = { connectionGeneration: lease.connectionGeneration };
   const prepared = prepareCreatePayload(
     lease.continuation,
     identity,
@@ -2035,7 +2029,7 @@ function observeNativePhase(
   detail: Partial<OpenAIResponsesWebSocketPhase> = {}
 ): void {
   observeOpenAIResponsesWebSocketPhase(
-    { key: state.options.sessionKey, connectionGeneration: state.lease.connectionGeneration },
+    { connectionGeneration: state.lease.connectionGeneration },
     state.options.onPhase,
     phase,
     {

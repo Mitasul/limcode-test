@@ -56,6 +56,16 @@ Phase E 的 stable ID 验证可靠内核 control plane 本身；旧应用 LLM/co
 
 离线入口：`native-provider-capability.test.mjs`、`native-tool-admission.test.mjs`、`native-request-orchestration.test.mjs`、`native-astra-integration.test.mjs` 与 `openAIResponsesWebSocketNative.test.cjs`。真实浏览器验证设置保存/重载、冻结能力门禁、转向回执及后继时间线；这些隔离验证不等同于真实付费模型调用。
 
+## Responses 提醒历史与缓存
+
+[修复与验证记录](../appendices/responses-prompt-cache-fix-note.md)。
+
+- 新普通请求以 `turnReminderDelivery=user_history` 冻结提醒的发送事实。提醒在创建时说明它代表紧随其后回复之前的状态，之后按原字节、原 user 身份重放；同次请求的重注入输入及附件增量同样留在原位。
+- 当前窗口的消息与工具调用来源提供确切 ModelRequest；原生逐项修订沿用现有 item 与分支复制身份。每份 recipe 的历史附加内容只在首个输出前放回一次，编辑过的消息不冒充原模型输出。
+- 普通请求与原生压缩保留这些实际可见内容，预算照实计入；文本摘要继续读取语义 Context。压缩或分支排除的来源不重新加入。旧请求没有冻结此模式时保持原来的尾部发送语义。
+- 标准 `prompt_cache_key` 为现有 conversationId，显式 requestBody 值优先。本机 WebSocket 连接按渠道、地址、模型、对话的字段组合复用。
+- 显式缓存的 read 位置是最新已保留物理响应开始前的输入终点；普通响应用生产者请求定位，原生响应用已有 providerResponseId 分组。布局和编码在当前遍历中折算位置，vendor 在该边界前最后一个合法载体上读、在本次末尾写，developer 断点保留，重合点只标一次。HTTP 原生后继沿用上个 POST 的确切输入长度；工具结果统一使用可承载断点的数组形态。
+
 ## Compression management
 
 - summary/body/source immutable；

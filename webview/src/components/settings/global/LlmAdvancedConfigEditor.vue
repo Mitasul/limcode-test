@@ -153,7 +153,7 @@ const promptCacheModeOptions: SettingsDropdownOption[] = [
   {
     value: 'key',
     label: '缓存 Key',
-    description: '仅发送按渠道、LLM 和对话自动生成的 prompt_cache_key；兼容不支持显式断点的 LLM。'
+    description: '为同一对话发送稳定的 prompt_cache_key；可使用渠道请求体中自定义的 Key。'
   },
   {
     value: 'explicit',
@@ -165,7 +165,7 @@ const promptCacheDescription = computed(() => {
   if (props.config.provider === 'openai-responses') {
     return promptCache.value.mode === 'explicit'
       ? '显式断点模式会发送 prompt_cache_options 并放置缓存断点：HTTP 请求把断点放在本轮提醒等每次都会变的内容之前；WebSocket 连续请求在最新的消息和工具结果上放断点，服务端保留此前的断点。只有 GPT-5.6 及之后的模型支持，其他模型自动改用缓存 Key 模式；部分兼容渠道可能不支持该参数。'
-      : '缓存 Key 模式会为同一渠道、LLM 和对话自动生成稳定的 prompt_cache_key；不发送显式断点或缓存时间参数。';
+      : '缓存 Key 模式会使用对话 ID 作为稳定的 prompt_cache_key；渠道请求体中自定义的 Key 优先生效。';
   }
   if (props.config.provider === 'claude') {
     return 'Claude 会在系统提示词、工具定义结束和聊天记录末尾写入缓存断点，并支持缓存时间档位。';

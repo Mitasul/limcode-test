@@ -129,7 +129,6 @@ const ALLOWED_METADATA_KEYS = new Set([
   'commitSeq',
   'streamSeq',
   'stage',
-  'sessionKeyHash',
   'connectionGeneration',
   'connectionReused',
   'connectionReason',

@@ -93,7 +93,7 @@ import {
   type TurnTaskCardReminderState
 } from './currentTurnTaskProjection';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
-import { CLAUDE_TURN_SCOPED_REMINDER_DELIVERY, claudeTurnScopedRemindersEnabled } from './turnReminderProjection';
+import { requestTurnReminderDelivery, type TurnReminderDeliveryMode } from './turnReminderProjection';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryKeysetCursor } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { orderRuntimeDeliveriesForInjection } from './runtimeDeliveryOrder';
@@ -1376,8 +1376,8 @@ export class ReliableAgentLoop {
    * replays byte-identical behavior. Capability inputs come from the frozen Turn authority (never
    * live settings). The base stays stable on a compatible lineage; effort changes become pending
    * configuration updates. Mode/model/provider changes and compression rebase discard stale updates.
-   * The same frozen authority also records how this request sends its reminders: only requests sent
-   * as Claude turn-scoped system messages are later re-sent verbatim in the history.
+   * The same frozen authority records the reminder delivery: Responses user snapshots and Claude
+   * turn-scoped reminders are later re-sent verbatim at their original request boundary.
    */
   private async readNativeRecipeFreeze(input: {
     settingsSnapshotContentObjectId?: string;
@@ -1393,7 +1393,7 @@ export class ReliableAgentLoop {
       freshConfigurationUpdate?: { effort: string };
     };
   }): Promise<{
-    turnReminderDelivery?: typeof CLAUDE_TURN_SCOPED_REMINDER_DELIVERY;
+    turnReminderDelivery?: TurnReminderDeliveryMode;
     nativeResponses?: OpenAIResponsesNativeCapabilities;
     nativeReasoning?: {
       baseEffort?: string;
@@ -1412,9 +1412,8 @@ export class ReliableAgentLoop {
       requireId(input.turnId, 'turnId'),
       input.settingsSnapshotContentObjectId
     );
-    const delivery = claudeTurnScopedRemindersEnabled(frozen.document)
-      ? { turnReminderDelivery: CLAUDE_TURN_SCOPED_REMINDER_DELIVERY }
-      : {};
+    const reminderDelivery = requestTurnReminderDelivery(frozen.document);
+    const delivery = reminderDelivery ? { turnReminderDelivery: reminderDelivery } : {};
     const documentModel = asRecord(frozen.document)?.model;
     const modelRecord = asRecord(documentModel);
     const thinking = asRecord(modelRecord?.thinkingConfig);

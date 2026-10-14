@@ -125,7 +125,9 @@ export interface MaterializedContextSegment {
   segmentKind: ContextSegmentKind;
   messageRole: string | null;
   modelSource?: ContextModelSource;
-  /** Frozen recipe ContentObject of the ModelRequest whose output this model message segment is. */
+  /** Producing request of a model message or tool-call occurrence. */
+  sourceModelRequestId?: string;
+  /** Frozen recipe ContentObject of the request that produced this occurrence. */
   sourceRecipeObjectId?: string;
   /** Exact selected ModelRequest authority, not the current provider configuration. */
   sourceReminderAuthority?: ContextReminderAuthoritySource;
@@ -2856,6 +2858,7 @@ function materializeContextSegments(records: ContextContentMaterializationRecord
     segmentKind: requireSegmentKind(record.segment.segment_kind),
     messageRole: nullableText(record.messageRole, 'Context message role'),
     ...(record.modelSource ? { modelSource: record.modelSource } : {}),
+    ...(record.sourceModelRequestId ? { sourceModelRequestId: record.sourceModelRequestId } : {}),
     ...(record.sourceRecipeObjectId ? { sourceRecipeObjectId: record.sourceRecipeObjectId } : {}),
     ...(record.sourceReminderAuthority ? { sourceReminderAuthority: record.sourceReminderAuthority } : {}),
     ...(record.sourceClaudeThinkingBinding ? { sourceClaudeThinkingBinding: record.sourceClaudeThinkingBinding } : {}),

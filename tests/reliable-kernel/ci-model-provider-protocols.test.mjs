@@ -7,7 +7,8 @@ import { load, kernel, llm, conversion, adaptation, user, model, call, result,
 
 const unified = await import('unified-llm-provider');
 const thinking = load('backend/capabilities/claudeThinkingAdaptation.js');
-const reminders = load('backend/capabilities/claudeTurnScopedReminders.js');
+const reminders = { ...load('backend/capabilities/claudeTurnScopedReminders.js'),
+  ...load('backend/capabilities/turnReminderLayout.js') };
 const capabilities = load('shared/modelCapabilities.js');
 const BINDING_ERROR = { status: 400, rawBody: { error: { message:
   'messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. '
@@ -443,24 +444,6 @@ test('Responses compact 只发送允许字段和冻结系统指令', async () =>
   assert.equal(body.service_tier, 'flex');
   assert.equal('context_management' in body, false);
   assert.equal('reasoning' in body, false);
-});
-
-test('Responses HTTP 断点挪到易失尾巴之前的数组工具结果，原输入不变', () => {
-  const { withOpenAIResponsesCacheBreakpointBeforeVolatileTail } = load('backend/capabilities/openAIResponsesTailCacheBreakpoint.js');
-  const breakpoint = { mode: 'explicit' };
-  const input = [{ role: 'developer', content: [{ type: 'input_text', text: 'system', prompt_cache_breakpoint: breakpoint }] },
-    { role: 'user', content: [{ type: 'input_text', text: 'question' }] },
-    { type: 'function_call', call_id: 'call', name: 'read', arguments: '{}' },
-    { type: 'function_call_output', call_id: 'call', output: [{ type: 'input_text', text: 'answer' }] },
-    { role: 'user', content: [{ type: 'input_text', text: 'reinjected' }] },
-    { role: 'user', content: [{ type: 'input_text', text: 'reminder', prompt_cache_breakpoint: breakpoint }] }];
-  const original = structuredClone(input);
-  const moved = withOpenAIResponsesCacheBreakpointBeforeVolatileTail({ headers: {}, body: {
-    model: 'gpt-5.6', input, prompt_cache_options: { mode: 'explicit', ttl: '30m' }
-  } }, 2);
-  assert.deepEqual(moved.body.input[3].output[0].prompt_cache_breakpoint, breakpoint);
-  assert.equal('prompt_cache_breakpoint' in moved.body.input[5].content[0], false);
-  assert.deepEqual(input, original);
 });
 
 test('网关拒绝自动 effort 后同次调用重发，目标记忆随配置修订失效', async () => {

@@ -304,7 +304,6 @@ export class VscodeReliableKernelProductRuntime {
             conversationId: trace.conversationId,
             modelRequestId: trace.requestId,
             stage: trace.phase,
-            sessionKeyHash: trace.sessionKeyHash,
             connectionGeneration: trace.connectionGeneration,
             ...(trace.elapsedMs !== undefined ? { elapsedMs: trace.elapsedMs } : {}),
             ...(trace.connectionReused !== undefined ? { connectionReused: trace.connectionReused } : {}),
