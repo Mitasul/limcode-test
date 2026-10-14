@@ -21,7 +21,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } f
 import { listAllDomainRows } from './repositoryPagination';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import { nativeItemRevisionId } from './turnOutput';
-import { projectTurnReminder, recipeReinjectedCurrentTurnInput, recipeTurnReminderDelivery } from './turnReminderProjection';
+import { projectTurnReminder, recipeReinjectedCurrentTurnInputs, recipeTurnReminderDelivery } from './turnReminderProjection';
 
 /** A producer lookup is private. Only identities used by this immutable occurrence are published. */
 export type ContextHandleOccurrenceEvidence =
@@ -67,7 +67,7 @@ const REF_KINDS: Record<string, ModelHandleKind> = { P: 'process', O: 'cursor', 
 const empty = (): ModelHandleCatalog => ({ entries: [], retiredRefs: [],
   identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION });
 interface RequestEvidence { request: DomainRow; conversationId: string; recipe: Record<string, unknown>; catalog: ModelHandleCatalog;
-  reminder?: string; reinjectedContentId?: string; inputBindings?: ModelHandleCatalog; producerScope?: ContextHandleProducerScope }
+  reminder?: string; reinjectedContentIds?: string[]; inputBindings?: ModelHandleCatalog; producerScope?: ContextHandleProducerScope }
 interface ContextHandleEvidenceOrigin {
   source: 'frozen_recipe' | 'native_projection' | 'native_admission' | 'native_request_scope' | 'upgrade_checkpoint';
   requestId?: string;
@@ -505,7 +505,7 @@ class OccurrenceReader {
         const normalized = parsed as { [key: string]: PlainJsonValue };
         const scoped = recipeTurnReminderDelivery(normalized) !== undefined;
         const reminder = scoped ? projectTurnReminder(normalized)?.content : undefined;
-        const reinjectedContentId = scoped ? recipeReinjectedCurrentTurnInput(normalized)?.contentObjectId : undefined;
+        const reinjectedContentIds = scoped ? recipeReinjectedCurrentTurnInputs(normalized).map(input => input.contentObjectId) : [];
         // Only compression's one-time exact legacy source proof needs its full recipe shape.
         const recipe = parsed.kind === 'reliable-context-compression' ? parsed : {
           kind: parsed.kind, round: parsed.round, ...(parsed.nativeResponses ? { nativeResponses: {} } : {})
@@ -524,7 +524,7 @@ class OccurrenceReader {
           this.requestSizes.delete(oldest); this.requests.delete(oldest);
         }
         return { request, recipe, catalog, conversationId: id(turn.conversation_id),
-          ...(reminder === undefined ? {} : { reminder }), ...(reinjectedContentId ? { reinjectedContentId } : {}),
+          ...(reminder === undefined ? {} : { reminder }), ...(reinjectedContentIds.length ? { reinjectedContentIds } : {}),
           ...(inputBindings ? { inputBindings } : {}), ...(producerScope ? { producerScope } : {}) };
       })();
       this.requests.set(key, pending);
@@ -647,7 +647,7 @@ class OccurrenceReader {
         // These tables are lookup evidence only: unused parallel entries never enter the result.
         if (this.selectedFacts) catalogs.push(...await this.nativeLookups(evidence));
         if (evidence.reminder) values.push(evidence.reminder);
-        if (evidence.reinjectedContentId) values.push((await this.content(evidence.reinjectedContentId)).text);
+        for (const contentId of evidence.reinjectedContentIds ?? []) values.push((await this.content(contentId)).text);
       }
     } else {
       const call = await this.get('ToolCall', occurrence.toolCallId);
@@ -662,7 +662,7 @@ class OccurrenceReader {
         const admissions = await this.list('ToolCallEvent', { tool_call_id: occurrence.toolCallId, event_kind: 'native_admission' });
         if (admissions.length > 0) {
           if (evidence.reminder) values.push(evidence.reminder);
-          if (evidence.reinjectedContentId) values.push((await this.content(evidence.reinjectedContentId)).text);
+          for (const contentId of evidence.reinjectedContentIds ?? []) values.push((await this.content(contentId)).text);
         }
         for (const admission of admissions) {
           const value = object(JSON.parse((await this.content(id(admission.content_object_id))).text), 'Native admission');

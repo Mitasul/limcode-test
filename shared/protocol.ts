@@ -2589,6 +2589,9 @@ export interface TurnInputResultPayload {
   deduplicated: boolean;
   intentId?: string;
   turnId?: string;
+  /** Exact input identity; several queued commands may share one admitted Turn. */
+  messageId?: string;
+  messageRevisionId?: string;
   commitSeq?: string;
   message?: string;
 }

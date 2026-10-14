@@ -72,17 +72,42 @@ export interface ReinjectedCurrentTurnInputReference {
   contentObjectId: string;
 }
 
-/** 那次请求把当前 Turn 输入作为易失尾巴重新注入过：返回那条输入；它的提醒原本跟在那条重新注入的输入后面。 */
-export function recipeReinjectedCurrentTurnInput(
-  recipe: PlainJsonValue | undefined
-): ReinjectedCurrentTurnInputReference | undefined {
-  const current = isRecord(recipe) && isRecord(recipe.currentTurnInput) ? recipe.currentTurnInput : undefined;
-  if (current?.reinject !== true) return undefined;
-  if (typeof current.messageRevisionId !== 'string' || !current.messageRevisionId
-    || typeof current.contentObjectId !== 'string' || !current.contentObjectId) {
-    throw new Error('ModelRequest recipe.currentTurnInput is missing its frozen input reference.');
+/** New requests freeze an ordered set. Published single-input recipes retain their original bytes and semantics. */
+export function recipeCurrentTurnInputs(recipe: PlainJsonValue | undefined): Array<{ [key: string]: PlainJsonValue }> {
+  if (!isRecord(recipe)) return [];
+  if (recipe.currentTurnInputs === undefined) {
+    return isRecord(recipe.currentTurnInput) ? [recipe.currentTurnInput] : [];
   }
-  return { messageRevisionId: current.messageRevisionId, contentObjectId: current.contentObjectId };
+  if (recipe.currentTurnInput !== undefined || !Array.isArray(recipe.currentTurnInputs)) {
+    throw new Error('ModelRequest recipe has conflicting current Turn input representations.');
+  }
+  const messages = new Set<string>();
+  const revisions = new Set<string>();
+  return recipe.currentTurnInputs.map(input => {
+    if (!isRecord(input) || input.kind !== 'current_turn_input'
+      || typeof input.messageId !== 'string' || !input.messageId
+      || typeof input.messageRevisionId !== 'string' || !input.messageRevisionId
+      || typeof input.contentObjectId !== 'string' || !input.contentObjectId
+      || typeof input.reinject !== 'boolean'
+      || messages.has(input.messageId) || revisions.has(input.messageRevisionId)) {
+      throw new Error('ModelRequest recipe.currentTurnInputs has invalid or duplicate input identities.');
+    }
+    messages.add(input.messageId); revisions.add(input.messageRevisionId);
+    return input;
+  });
+}
+
+/** Replay each reinjected input before that request's reminder, in its frozen order. */
+export function recipeReinjectedCurrentTurnInputs(
+  recipe: PlainJsonValue | undefined
+): ReinjectedCurrentTurnInputReference[] {
+  return recipeCurrentTurnInputs(recipe).filter(current => current.reinject === true).map(current => {
+    if (typeof current.messageRevisionId !== 'string' || !current.messageRevisionId
+      || typeof current.contentObjectId !== 'string' || !current.contentObjectId) {
+      throw new Error('ModelRequest recipe is missing its frozen input reference.');
+    }
+    return { messageRevisionId: current.messageRevisionId, contentObjectId: current.contentObjectId };
+  });
 }
 
 /**

@@ -1404,6 +1404,8 @@ export class VscodeReliableKernelCommandRouter {
       deduplicated: result.deduplicated,
       ...(result.intentId ? { intentId: result.intentId } : {}),
       ...(result.turnId ? { turnId: result.turnId } : {}),
+      ...(result.messageId ? { messageId: result.messageId } : {}),
+      ...(result.messageRevisionId ? { messageRevisionId: result.messageRevisionId } : {}),
       ...(result.commitSeq ? { commitSeq: result.commitSeq } : {})
     });
   }

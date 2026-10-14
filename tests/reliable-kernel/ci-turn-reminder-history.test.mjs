@@ -7,7 +7,7 @@ const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
 const { ModelProviderControlPlane } = load('backend/reliableKernel/modelProviderControlPlane.js');
-const { projectTurnReminder, requestTurnReminderDelivery } = load('backend/reliableKernel/turnReminderProjection.js');
+const { projectTurnReminder, requestTurnReminderDelivery, recipeCurrentTurnInputs } = load('backend/reliableKernel/turnReminderProjection.js');
 
 const responses = { model: { provider: 'openai-responses' } };
 const ordinary = { kind: 'reliable-agent-turn', turnReminderDelivery: 'user_history' };
@@ -77,11 +77,72 @@ test('重注入输入随首个发送位置保留一次，原生压缩保留历�
   const compact = { kind: 'reliable-context-compression', compressionMethodKind: 'provider_native' };
   const entries = await plane.materializeTurnReminderHistory(responses, compact, history);
   assert.equal(entries.length, 2);
-  assert.equal(entries[0].reinjectedInput.messageRevisionId, 'input-revision');
-  assert.equal(entries[1].reinjectedInput, undefined);
+  assert.equal(entries[0].reinjectedInputs[0].messageRevisionId, 'input-revision');
+  assert.equal(entries[1].reinjectedInputs, undefined);
   assert.match(entries[1].content, /latest$/);
   assert.equal(await plane.materializeTurnReminderHistory(responses,
     { ...compact, compressionMethodKind: 'llm_summary' }, history), undefined);
   assert.equal(await plane.materializeTurnReminderHistory(responses,
     { ...compact, sourceReplay: 'immutable_provenance' }, history), undefined);
+});
+
+
+test('有序输入集合按独立修订冻结和重放，缺项、乱序与混合身份拒绝', async () => {
+  const inputs = ['a', 'b'].map(id => ({ kind: 'current_turn_input', messageId: `message-${id}`,
+    messageRevisionId: `revision-${id}`, contentObjectId: `body-${id}`, reinject: true, estimatedTokens: 8 }));
+  const recipe = { ...ordinary, currentTurnInputs: inputs, attachmentCatalogState: { catalog: [], placements: [] } };
+  const objects = { first: recipe, second: { ...recipe, runtimeStatusCard: { card: 'second-round' } },
+    'body-a': { role: 'user', parts: [{ text: 'first input' }] },
+    'body-b': { role: 'user', parts: [{ text: 'second input' }] } };
+  const { plane } = fixture(objects);
+  const history = await plane.materializeTurnReminderHistory(responses, ordinary,
+    [source('first-text', 'first'), source('first-call', 'first', 'tool_pair'), source('next-text', 'second')]);
+  assert.deepEqual(history[0].reinjectedInputs.map(input => input.messageRevisionId), ['revision-a', 'revision-b']);
+  assert.equal(history[1].reinjectedInputs, undefined);
+  assert.match(history[1].content, /second-round$/);
+  assert.deepEqual(await plane.materializeTurnReminderHistory(responses,
+    { kind: 'reliable-context-compression', compressionMethodKind: 'provider_native' },
+    [source('first-text', 'first'), source('next-text', 'second')]), history);
+  assert.throws(() => recipeCurrentTurnInputs({ ...recipe, currentTurnInput: inputs[0] }), /conflicting/);
+  assert.throws(() => recipeCurrentTurnInputs({ ...recipe, currentTurnInputs: [inputs[0], inputs[0]] }), /duplicate/);
+
+  const rows = {
+    Turn: [{ id: 'turn', conversation_id: 'conversation' }],
+    MessageTurnLink: [...inputs].reverse().map(input => ({ turn_id: 'turn', message_id: input.messageId, role: 'input' })),
+    MessagePartOfConversation: inputs.map((input, index) => ({ message_id: input.messageId,
+      conversation_id: 'conversation', message_seq: BigInt(index + 4) })),
+    MessageRevision: inputs.map(input => ({ id: input.messageRevisionId, message_id: input.messageId,
+      role: 'user', content_object_id: input.contentObjectId }))
+  };
+  const read = command => command.domain === 'ContentObject'
+    ? { id: command.id, content_type: 'application/json' }
+    : command.kind === 'get' ? rows[command.domain]?.find(row => row.id === command.id) ?? null
+    : (rows[command.domain] ?? []).filter(row => Object.entries(command.where ?? {}).every(([key, value]) => row[key] === value));
+  const provider = new ModelProviderControlPlane({
+    async snapshot(commands) { return { snapshot: commands.map(read) }; },
+    async snapshotAll(command) { return { snapshot: read(command) }; }
+  }, { async read(metadata) { return Buffer.from(JSON.stringify(objects[metadata.id])); } });
+  const materialized = await provider.materializeRequestAddenda(recipe, 'turn');
+  assert.deepEqual(materialized.requestAddenda.currentTurnInputs.map(input => input.messageId), ['message-a', 'message-b']);
+  await assert.rejects(provider.materializeRequestAddenda({ ...recipe, currentTurnInputs: inputs.slice(0, 1) }, 'turn'), /complete ordered/);
+  await assert.rejects(provider.materializeRequestAddenda({ ...recipe, currentTurnInputs: [...inputs].reverse() }, 'turn'), /provenance/);
+  await assert.rejects(provider.materializeRequestAddenda({ ...recipe, currentTurnInputs: [
+    { ...inputs[0], contentObjectId: inputs[1].contentObjectId }, inputs[1]
+  ] }, 'turn'), /conflicts/);
+
+  // A fork keeps the original recipe ids even after source messages are deleted. Each position
+  // must prove its own copied revision and immutable segment; equal CAS bytes are not identity.
+  rows.MessageTurnLink = inputs.map(input => ({ turn_id: 'turn', message_id: `copy-${input.messageId}`, role: 'input' }));
+  rows.MessagePartOfConversation = inputs.map((input, index) => ({ message_id: `copy-${input.messageId}`,
+    conversation_id: 'conversation', message_seq: BigInt(index + 1) }));
+  rows.MessageRevision = inputs.map(input => ({ id: `copy-${input.messageRevisionId}`, message_id: `copy-${input.messageId}`,
+    revision_seq: 1n, role: 'user', content_object_id: input.contentObjectId }));
+  rows.ContextSegment = inputs.map(input => ({ id: `segment-${input.messageRevisionId}`, segment_kind: 'message',
+    content_object_id: input.contentObjectId }));
+  rows.ContextSegmentSource = inputs.flatMap(input => [input.messageRevisionId, `copy-${input.messageRevisionId}`].map(id => ({
+    source_kind: 'message_revision', source_id: id, source_revision: 1n, segment_id: `segment-${input.messageRevisionId}`
+  })));
+  const copied = await provider.materializeRequestAddenda(recipe, 'turn');
+  assert.deepEqual(copied, materialized);
+  await assert.rejects(provider.materializeRequestAddenda({ ...recipe, currentTurnInputs: [...inputs].reverse() }, 'turn'), /copied revision/);
 });

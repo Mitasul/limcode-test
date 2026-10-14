@@ -1381,33 +1381,47 @@ export class ContextSequenceControlPlane {
 
   /** Prepared steps attach a new or already committed MessageRevision atomically with caller state. */
   public async prepareMessageAppendMutation(input: MessageContextAppendPlanInput): Promise<ContextMutationPlan> {
+    return this.prepareMessagesAppendMutation({
+      conversationId: input.conversationId,
+      messages: [input],
+      resultingEstimatedTokens: input.resultingEstimatedTokens
+    });
+  }
+
+  /** One ordered append, one immutable root and one head CAS for all inputs admitted by a Turn. */
+  public async prepareMessagesAppendMutation(input: {
+    conversationId: string;
+    messages: readonly Omit<MessageContextAppendPlanInput, 'conversationId' | 'resultingEstimatedTokens'>[];
+    resultingEstimatedTokens?: number;
+  }): Promise<ContextMutationPlan> {
     const conversationId = requireId(input.conversationId, 'conversationId');
-    const revisionId = requireId(input.messageRevisionId, 'messageRevisionId');
-    const contentObjectId = requireId(input.contentObjectId, 'contentObjectId');
-    const existingRevisionSeq = input.existingRevisionSeq === undefined
-      ? undefined
-      : requireBigInt(input.existingRevisionSeq, 'existingRevisionSeq');
-    if (existingRevisionSeq !== undefined && existingRevisionSeq < 1n) {
-      throw new TypeError('existingRevisionSeq must be positive.');
-    }
-    const contentByteLength = requireBigInt(input.contentByteLength, 'contentByteLength');
-    if (contentByteLength < 0n) throw new TypeError('contentByteLength must be non-negative.');
-    const contentEstimatedTokens = optionalEstimatedTokens(input.contentEstimatedTokens)
-      ?? estimateTokens(contentByteLength);
+    if (input.messages.length === 0) throw new TypeError('Message Context append requires at least one message.');
     const resultingEstimatedTokens = optionalEstimatedTokens(input.resultingEstimatedTokens);
     const head = await this.getHead(conversationId);
     const baseRootId = head ? requireId(head.root_id, 'ConversationContextHeadLink.root_id') : null;
     const base = await this.readBaseShape(conversationId, baseRootId);
-    const segmentId = stableSegmentId([{
-      sourceKind: 'message_revision', sourceId: revisionId, sourceRevision: 0n
-    }]);
-    const parentNodeId = base.compression ? base.tailNodeId : base.rootNodeId;
-    const nodeId = contextSequenceNodeId(parentNodeId, segmentId);
-    const rootId = contextAppendRootId(conversationId, baseRootId, nodeId);
     const now = this.timestamp();
-    return {
-      steps: [
-        ...headAssertionSteps(conversationId, head, baseRootId),
+    let parentNodeId = base.compression ? base.tailNodeId : base.rootNodeId;
+    let estimatedTokens = base.estimatedTokens;
+    const occurrenceSteps: RepositoryTransactionStep[] = [];
+    const handleOccurrences: ContextHandleOccurrenceEvidence[] = [];
+    for (const message of input.messages) {
+      const revisionId = requireId(message.messageRevisionId, 'messageRevisionId');
+      const contentObjectId = requireId(message.contentObjectId, 'contentObjectId');
+      const existingRevisionSeq = message.existingRevisionSeq === undefined
+        ? undefined
+        : requireBigInt(message.existingRevisionSeq, 'existingRevisionSeq');
+      if (existingRevisionSeq !== undefined && existingRevisionSeq < 1n) {
+        throw new TypeError('existingRevisionSeq must be positive.');
+      }
+      const contentByteLength = requireBigInt(message.contentByteLength, 'contentByteLength');
+      if (contentByteLength < 0n) throw new TypeError('contentByteLength must be non-negative.');
+      estimatedTokens += optionalEstimatedTokens(message.contentEstimatedTokens) ?? estimateTokens(contentByteLength);
+      const segmentId = stableSegmentId([{
+        sourceKind: 'message_revision', sourceId: revisionId, sourceRevision: 0n
+      }]);
+      const nodeId = contextSequenceNodeId(parentNodeId, segmentId);
+      occurrenceSteps.push(
         ...(existingRevisionSeq === undefined ? [] : [
           DOMAIN_REPOSITORIES.domain('MessageRevision').assert(revisionId, {
             revision_seq: existingRevisionSeq,
@@ -1421,15 +1435,26 @@ export class ContextSequenceControlPlane {
           contentObjectId,
           now
         }),
-        ...nodeInsertSteps([{ id: nodeId, parentNodeId, segmentId, now }]),
+        ...nodeInsertSteps([{ id: nodeId, parentNodeId, segmentId, now }])
+      );
+      parentNodeId = nodeId;
+      if (message.handleOccurrence) handleOccurrences.push(message.handleOccurrence);
+    }
+    const nodeId = requireId(parentNodeId, 'appended nodeId');
+    const appendedCount = BigInt(input.messages.length);
+    const rootId = contextAppendRootId(conversationId, baseRootId, nodeId);
+    return {
+      steps: [
+        ...headAssertionSteps(conversationId, head, baseRootId),
+        ...occurrenceSteps,
         DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
           id: rootId,
           conversation_id: conversationId,
           root_node_id: base.compression ? base.rootNodeId : nodeId,
           tail_node_id: base.compression ? nodeId : null,
-          tail_segment_count: base.compression ? base.tailSegmentCount + 1n : 0n,
-          segment_count: base.segmentCount + 1n,
-          estimated_tokens: resultingEstimatedTokens ?? (base.estimatedTokens + contentEstimatedTokens),
+          tail_segment_count: base.compression ? base.tailSegmentCount + appendedCount : 0n,
+          segment_count: base.segmentCount + appendedCount,
+          estimated_tokens: resultingEstimatedTokens ?? estimatedTokens,
           created_at: now
         }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
         ...(await prepareContextHandleHeadTransition({
@@ -1437,8 +1462,9 @@ export class ContextSequenceControlPlane {
           previousRootId: baseRootId, nextRootId: rootId, mode: 'append', now,
           rootShape: { rootNodeId: base.compression ? base.rootNodeId : nodeId,
             tailNodeId: base.compression ? nodeId : null,
-            tailSegmentCount: base.compression ? base.tailSegmentCount + 1n : 0n, segmentCount: base.segmentCount + 1n },
-          occurrence: input.handleOccurrence
+            tailSegmentCount: base.compression ? base.tailSegmentCount + appendedCount : 0n,
+            segmentCount: base.segmentCount + appendedCount },
+          occurrences: handleOccurrences
         })).steps,
         ...headMutationSteps(conversationId, head, rootId, now)
       ]

@@ -58,7 +58,8 @@ export async function createUiWorkflowFixture() {
     const emit = message => { for (const listener of [...listeners]) listener({ data: structuredClone(message) }); };
     const ack = (submission, payload = {}) => emit({ type: protocol.BridgeMessageType.TurnInputResult,
       correlationId: submission.requestId, payload: { commandId: submission.commandId, conversationId,
-        requestType: submission.requestType, status: 'accepted', admitted: true, turnId: 'turn', ...payload } });
+        requestType: submission.requestType, status: 'accepted', admitted: true, turnId: 'turn',
+        messageId: 'input', messageRevisionId: 'revision', ...payload } });
     async function render(component, props = {}) {
       await vue.nextTick(); let setup;
       const app = vue.createSSRApp(component, props).use(active);

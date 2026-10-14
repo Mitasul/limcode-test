@@ -218,6 +218,11 @@ export function projectTurnClientRecord(
   if (!raw) throw new Error(`Turn ${turnId} does not exist.`);
   const record = DOMAIN_REPOSITORIES.codec('Turn').decode(raw as Record<string, unknown>);
   if (record.status !== 'active') return record;
+  // Ordinary Turns already have timeline anchors, including a batch with multiple input links.
+  // Only retry/edit-and-run Turns without a new input need the unique intent-source enrichment.
+  if (prepareCached(database, `
+    SELECT 1 FROM message_turn_link WHERE turn_id = ? AND role = 'input' LIMIT 1
+  `).get(turnId)) return record;
 
   const sources = prepareCached(database, `
     SELECT content.*

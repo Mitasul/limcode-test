@@ -130,7 +130,7 @@ async function list(app, domain, where = {}) {
   }))).snapshot;
 }
 
-async function appendMessage(app, seeded, suffix, role, text) {
+async function appendMessage(app, seeded, suffix, role, text, linkRole = 'context-fixture') {
   const contentObject = await app.contentStore.ingest(app.database, text, 'text/plain');
   const messageId = `message-${suffix}`;
   const revisionId = `message-revision-${suffix}`;
@@ -153,7 +153,7 @@ async function appendMessage(app, seeded, suffix, role, text) {
       id: `membership-${suffix}`, conversation_id: seeded.conversationId, message_id: messageId, created_at: now
     }, { column: 'message_seq', scope: { conversation_id: seeded.conversationId } }),
     kernel.DOMAIN_REPOSITORIES.domain('MessageTurnLink').insert({
-      id: `message-turn-${suffix}`, turn_id: seeded.turnId, message_id: messageId, role: 'context-fixture', created_at: now
+      id: `message-turn-${suffix}`, turn_id: seeded.turnId, message_id: messageId, role: linkRole, created_at: now
     }),
     ...plan.steps
   ]);
@@ -214,6 +214,7 @@ function registerCases(test) {
 test('a summary that does not shrink the Context is still skipped as non_reducing and replays without a second call', async () => {
   const thresholdTokens = 1;
   await withTurn('reduction-gate-non-reducing', thresholdTokens, async (app, seeded) => {
+    await appendMessage(app, seeded, 'batch-input', 'user', 'second ordered input', 'input');
     await appendMessage(app, seeded, 'source', 'assistant', 'small-source');
     await appendMessage(app, seeded, 'tail', 'user', 'protected-tail');
     const head = await app.context.currentHeadRootId(seeded.conversationId);
@@ -226,6 +227,13 @@ test('a summary that does not shrink the Context is still skipped as non_reducin
       trigger: 'auto',
       requestBudget: requestBudget(thresholdTokens, 0, 2_000)
     };
+    // The requested prefix would remove only the first input. Keep the entire input batch
+    // instead of replaying its first message behind the retained second message.
+    const partialInput = await coordinator.coordinate({ ...command, compressSegmentCount: 1 });
+    assert.equal(partialInput.status, 'skipped');
+    assert.equal(partialInput.reason, 'finite_tail');
+    assert.equal(dispatches, 0);
+    assert.equal(await app.context.currentHeadRootId(seeded.conversationId), head);
     const first = await coordinator.coordinate(command);
     assert.equal(first.status, 'skipped');
     assert.equal(first.reason, 'non_reducing');

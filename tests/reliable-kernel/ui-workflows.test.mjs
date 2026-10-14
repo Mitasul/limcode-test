@@ -100,14 +100,17 @@ test('输入：send-as-new需要确认覆盖草稿，取消保留原内容，确
   assert.deepEqual(h.view.selectedAttachments.map(item => item.inlineData.name), ['original.txt']);
 });
 
-test('输入：持久receipt先于ACK只确认一次，精确正文就绪后才撤下本地输入', async t => {
+test('输入：持久receipt先于ACK只确认一次，同回合多输入按确切正文撤下本地输入', async t => {
   const h = ui.stores(t), chat = h.useChat(), sent = chat.sendMessage('input awaiting body');
   assert.equal(ui.posted.at(-1).id, sent.requestId); assert.doesNotThrow(() => structuredClone(ui.posted.at(-1)));
   h.feed.records = { ConversationCommandReceipt: { receipt: { id: 'receipt', command_id: sent.commandId, conversation_id: h.conversationId } } };
   await tick(); assert.ok(chat.currentTurnInputAcknowledgements.value[sent.commandId]);
   chat.dismissTurnInputAcknowledgement(sent.commandId); h.ack(sent); await tick();
   assert.equal(chat.currentTurnInputAcknowledgements.value[sent.commandId], undefined);
-  h.message(); h.body('unrelated', 'other message'); await tick();
+  h.message('turn', 'batch-other', 'unrelated'); h.body('unrelated', 'other message'); await tick();
+  assert.equal(chat.currentTurnInputEchoes.value[0].displayTarget, undefined);
+  h.message(); await tick();
+  assert.equal(chat.currentTurnInputEchoes.value[0].displayTarget.messageId, 'input');
   assert.equal(chat.currentTurnInputEchoes.value[0].submission.text, 'input awaiting body');
   const shell = await h.render(ui.messageList); assert.ok(shell.html.includes('input awaiting body'));
   h.body('revision', 'committed input'); await tick();

@@ -18,7 +18,7 @@ export interface TurnInputObservation {
   displayInvalidated: boolean;
 }
 
-/** A command ACK names the Turn; its input Link names the exact Message. Never compare bodies. */
+/** Match the command's exact input identity; a batch can admit several inputs into one Turn. */
 export function observeTurnInputSubmission(records: Records, pending: PendingTurnInputSubmission): TurnInputObservation {
   const result = pending.result;
   const durableReceiptObserved = Object.values(records.ConversationCommandReceipt ?? {}).some((receipt) =>
@@ -29,17 +29,16 @@ export function observeTurnInputSubmission(records: Records, pending: PendingTur
     || intent?.conversation_id === pending.conversationId);
   let displayTarget = pending.displayTarget;
   let displayInvalidated = false;
-  if (!displayTarget && turn?.conversation_id === pending.conversationId) {
-    const inputs = Object.values(records.MessageTurnLink ?? {}).filter((link) =>
-      link.turn_id === result!.turnId && link.role === 'input');
-    const message = inputs.length === 1 && typeof inputs[0].message_id === 'string'
-      ? records.Message?.[inputs[0].message_id] : undefined;
+  if (!displayTarget && turn?.conversation_id === pending.conversationId
+    && result?.messageId && result.messageRevisionId) {
+    const input = Object.values(records.MessageTurnLink ?? {}).find((link) =>
+      link.turn_id === result.turnId && link.role === 'input' && link.message_id === result.messageId);
+    const message = input ? records.Message?.[result.messageId] : undefined;
     if (message?.conversation_id === pending.conversationId && message.role === 'user') {
-      // Another window can edit or delete the input before its first detail response. Its current
-      // revision must then render itself, rather than receiving the submitted draft as a body.
-      displayInvalidated = message.deleted_at != null || String(message.revision_seq) !== '1';
-      if (!displayInvalidated && typeof message.id === 'string' && typeof message.revision_id === 'string') {
-        displayTarget = { messageId: message.id, revisionId: message.revision_id };
+      // A later edit must render its own body, never the draft from this command.
+      displayInvalidated = message.deleted_at != null || message.revision_id !== result.messageRevisionId;
+      if (!displayInvalidated) {
+        displayTarget = { messageId: result.messageId, revisionId: result.messageRevisionId };
       }
     }
   }

@@ -1,3 +1,4 @@
+import { recipeCurrentTurnInputs } from './turnReminderProjection';
 import { freezeToolDefinitions, resolveFrozenToolDefinitions } from './frozenToolDefinitions';
 import { resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
 import { createHash } from 'node:crypto';
@@ -406,8 +407,7 @@ export class ReliableContextCompressionCoordinator {
       if (currentHead !== headRootId && !committed) throw new Error('Context changed without a committed repair of the rejected request.');
     }
     await this.assertProviderRecoverySource(source, headRootId);
-    const currentInput = source.recipe.currentTurnInput;
-    const currentInputRecord = currentInput && typeof currentInput === 'object' && !Array.isArray(currentInput) ? currentInput : undefined;
+    const currentInputs = recipeCurrentTurnInputs(source.recipe);
     let previewRecipe = source.recipe;
     if (headRootId !== source.rootId) {
       // Native tools can introduce managed media and short references after the rejected request
@@ -416,7 +416,7 @@ export class ReliableContextCompressionCoordinator {
       const materialized = await this.context.materialize(headRootId);
       const attachmentCatalogState = await this.attachmentCatalog.projectState(conversationId,
         materialized.segments,
-        typeof currentInputRecord?.messageRevisionId === 'string' ? [currentInputRecord.messageRevisionId] : []);
+        currentInputs.map(input => requireId(input.messageRevisionId, 'Current Turn input revision')));
       const attachmentHandles = await this.modelProvider.ensureAttachmentHandles(conversationId, attachmentCatalogState.catalog);
       const persistentHandles = reconcileHistoricalModelHandleCatalogs([
         await readConversationContextHandleCatalog(this.database, this.contentStore, conversationId),
@@ -449,7 +449,8 @@ export class ReliableContextCompressionCoordinator {
       headRootId,
       trigger: 'auto', providerContextOverflowRequestId: failedModelRequestId,
       requestBudget: this.modelProvider.planFullRequest(fullRequest, adapter),
-      protectedCurrentInputTokens: typeof currentInputRecord?.estimatedTokens === 'number' ? currentInputRecord.estimatedTokens : 0,
+      protectedCurrentInputTokens: currentInputs.reduce((total, input) =>
+        total + (typeof input.estimatedTokens === 'number' ? input.estimatedTokens : 0), 0),
       tools: await resolveFrozenToolDefinitions(this.database, this.contentStore, source.recipe),
       modelHandleCatalog: fullRequest.resolvedModelHandleCatalog
     });
@@ -659,6 +660,14 @@ export class ReliableContextCompressionCoordinator {
     const { structure: materialized, content: semanticMaterialized } =
       await this.context.materializeWithStructure(headRootId);
     if (materialized.records.length === 0) return { status: 'skipped', reason: 'empty_context' };
+    // A batch is an ordered user input unit. Cutting through it would leave its later messages
+    // in Context while reinjecting earlier ones at the tail, reversing the original input order.
+    const inputBoundary = await this.readCurrentTurnInputBoundary(turnId, materialized.records);
+    const closeBoundary = (requestedCount: number): number => {
+      const count = closeToolExchangeBoundary(materialized.records, requestedCount);
+      return inputBoundary && count > inputBoundary.start && count < inputBoundary.end
+        ? inputBoundary.start : count;
+    };
     if (command.sourceReplay && command.compressSegmentCount !== undefined
       && command.compressSegmentCount !== materialized.records.length) {
       throw new TypeError('Immutable compression source reconstruction requires the complete current window.');
@@ -761,7 +770,7 @@ export class ReliableContextCompressionCoordinator {
         : requirePrefixCount(command.compressSegmentCount, materialized.records.length);
     const plannedSourceSegmentCount = policy.methodKind === 'provider_native' && attempt.nativeKind === 'openai_responses'
       ? requestedSourceSegmentCount
-      : closeToolExchangeBoundary(materialized.records, requestedSourceSegmentCount);
+      : closeBoundary(requestedSourceSegmentCount);
     if (plannedSourceSegmentCount <= 0 || plannedSourceSegmentCount > materialized.records.length) {
       return {
         status: 'skipped',
@@ -792,7 +801,7 @@ export class ReliableContextCompressionCoordinator {
       };
     }
     let sourceSegmentCount = nativeGuard.status === 'protect'
-      ? closeToolExchangeBoundary(materialized.records, nativeGuard.sourceSegmentCount)
+      ? closeBoundary(nativeGuard.sourceSegmentCount)
       : plannedSourceSegmentCount;
     if (command.sourceReplay && sourceSegmentCount !== materialized.records.length) {
       throw Object.assign(new Error('Immutable source reconstruction cannot leave a protected partial window; finish pending work first.'), {
@@ -825,7 +834,9 @@ export class ReliableContextCompressionCoordinator {
       // not assume token estimates are monotone; every chosen prefix passes both real input gates.
       const boundaries: number[] = [];
       for (let count = 1; count <= desiredSourceSegmentCount; count += 1) {
-        if (materialized.records[count]?.segment.segment_kind !== 'tool_pair') boundaries.push(count);
+        if (materialized.records[count]?.segment.segment_kind === 'tool_pair') continue;
+        if (inputBoundary && count > inputBoundary.start && count < inputBoundary.end) continue;
+        boundaries.push(count);
       }
       const preparedContext: FullProviderContextItem[] = semanticMaterialized.segments
         .slice(0, desiredSourceSegmentCount).map(segment => ({
@@ -1600,6 +1611,32 @@ export class ReliableContextCompressionCoordinator {
     const row = snapshot.snapshot[0];
     if (Array.isArray(row)) throw new Error(`${domain} ${id} lookup returned a list.`);
     return row ?? undefined;
+  }
+
+  /** Only the active Turn's input revisions matter; do not scan historical messages or bodies. */
+  private async readCurrentTurnInputBoundary(
+    turnId: string, records: readonly StructuralContextRecord[]
+  ): Promise<{ start: number; end: number } | undefined> {
+    const inputs = await listAllDomainRows(this.database, 'MessageTurnLink', { turn_id: turnId, role: 'input' });
+    if (inputs.length < 2) return undefined;
+    const current = await this.database.snapshot(inputs.map(input =>
+      DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').list({ where: { message_id: input.message_id }, limit: 2 })));
+    const segmentIds = new Set<string>();
+    for (const value of current.snapshot) {
+      const links = rows(value);
+      if (links.length !== 1) throw new Error('Current Turn input must have one current revision before compression.');
+      const sources = await listAllDomainRows(this.database, 'ContextSegmentSource', {
+        source_kind: 'message_revision', source_id: links[0].revision_id
+      });
+      for (const source of sources) segmentIds.add(requireId(source.segment_id, 'Input ContextSegmentSource.segment_id'));
+    }
+    let start = records.length;
+    let end = 0;
+    records.forEach((record, index) => {
+      if (!segmentIds.has(requireId(record.segment.id, 'ContextSegment.id'))) return;
+      start = Math.min(start, index); end = index + 1;
+    });
+    return end > start + 1 ? { start, end } : undefined;
   }
 
   private async requireDomain(domain: string, id: string): Promise<DomainRow> {

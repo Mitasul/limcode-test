@@ -93,9 +93,10 @@ import {
   type TurnTaskCardReminderState
 } from './currentTurnTaskProjection';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
-import { requestTurnReminderDelivery, type TurnReminderDeliveryMode } from './turnReminderProjection';
+import { recipeCurrentTurnInputs, requestTurnReminderDelivery, type TurnReminderDeliveryMode } from './turnReminderProjection';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryKeysetCursor } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
+import { readOrderedTurnInputMessages } from './turnInputMessages';
 import { orderRuntimeDeliveriesForInjection } from './runtimeDeliveryOrder';
 import { RuntimeDatabase } from './runtimeDatabase';
 import {
@@ -363,7 +364,7 @@ interface OrdinaryRequestPlanningFacts {
 interface CurrentTurnRequestState {
   /** Operation-local immutable root view, reused by native predecessor selection. */
   structure: MaterializedContextStructure;
-  reference?: FrozenCurrentTurnInputReference;
+  references: FrozenCurrentTurnInputReference[];
   compressionBoundaryId?: string;
 }
 
@@ -1233,7 +1234,7 @@ export class ReliableAgentLoop {
     const attachmentCatalogState = await this.modelProvider.projectAttachmentCatalogState(
       conversationId,
       materialized.segments.map((segment) => ({ segmentId: segment.segmentId })),
-      currentTurnState.reference ? [currentTurnState.reference.messageRevisionId] : []
+      currentTurnState.references.map(reference => reference.messageRevisionId)
     );
     const attachmentHandles = await this.modelProvider.ensureAttachmentHandles(
       conversationId,
@@ -1246,14 +1247,14 @@ export class ReliableAgentLoop {
       ...(runtimeStatusCard ? [runtimeStatusCard] : []),
       input.tools
     ];
-    if (currentTurnState.reference) {
+    for (const reference of currentTurnState.references) {
       const inputContentObject = await this.requireExisting(
         'ContentObject',
-        currentTurnState.reference.contentObjectId
+        reference.contentObjectId
       ) as unknown as ContentObjectMetadata;
       const inputContent = (await this.contentStore.read(inputContentObject)).toString('utf8');
       handleSources.push(inputContent);
-      if (currentTurnState.reference.reinject) contextInputSources.push(inputContent);
+      if (reference.reinject) contextInputSources.push(inputContent);
     }
     const seeds = mergeModelHandleCatalogs(attachmentHandles, runtimeStatus.contextHandles);
     const handleBuilder = createModelHandleCatalogBuilder(seeds);
@@ -1346,7 +1347,7 @@ export class ReliableAgentLoop {
       modelHandleCatalogReference,
       contextHandleScope: runtimeStatus.contextHandleScope,
       ...(contextHandleInputBindings.entries.length ? { contextHandleInputBindings } : {}),
-      ...(currentTurnState.reference ? { currentTurnInput: currentTurnState.reference } : {}),
+      currentTurnInputs: currentTurnState.references,
       ...(turnTaskCard ? {
         turnTaskCard,
         turnTaskCardBoundaryKey: boundaryKey,
@@ -1614,48 +1615,33 @@ export class ReliableAgentLoop {
     const compressionBoundaryId = firstSegment?.segment_kind === 'compression'
       ? requireId(firstSegment.id, 'ContextSegment.id')
       : undefined;
-    const inputLinks = await this.list('MessageTurnLink', { turn_id: turnId, role: 'input' }, 2);
-    if (inputLinks.length === 0) return { compressionBoundaryId, structure: current };
-    if (inputLinks.length !== 1) throw new Error(`Turn ${turnId} must have at most one input Message.`);
-    const messageId = requireId(inputLinks[0].message_id, 'MessageTurnLink.message_id');
-    const currentLinks = await this.list('MessageCurrentRevisionLink', { message_id: messageId }, 2);
-    if (currentLinks.length !== 1) throw new Error(`Input Message ${messageId} must have one current revision.`);
-    const messageRevisionId = requireId(
-      currentLinks[0].revision_id,
-      'MessageCurrentRevisionLink.revision_id'
-    );
-    const snapshot = await this.database.snapshot([
-      DOMAIN_REPOSITORIES.domain('MessageRevision').get(messageRevisionId),
-      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
-        where: { source_kind: 'message_revision', source_id: messageRevisionId }, limit: 8
-      })
-    ]);
-    const revision = requireRow(snapshot.snapshot[0], `MessageRevision ${messageRevisionId}`);
-    if (revision.message_id !== messageId || revision.role !== 'user') {
-      throw new Error(`Current input revision ${messageRevisionId} conflicts with Turn ${turnId}.`);
-    }
-    const sources = rows(snapshot.snapshot[1]);
-    const currentSegmentIds = new Set(current.records.map((record) =>
-      requireId(record.segment.id, 'ContextSegment.id')
-    ));
-    const presentInCurrentWindow = sources.some((source) =>
-      currentSegmentIds.has(requireId(source.segment_id, 'ContextSegmentSource.segment_id'))
-    );
-    const contentObjectId = requireId(revision.content_object_id, 'MessageRevision.content_object_id');
-    const contentObject = await this.requireExisting('ContentObject', contentObjectId) as unknown as ContentObjectMetadata;
-    const content = await this.contentStore.read(contentObject);
-    return {
-      structure: current,
-      ...(compressionBoundaryId ? { compressionBoundaryId } : {}),
-      reference: {
-        kind: 'current_turn_input',
-        messageId,
-        messageRevisionId,
-        contentObjectId,
+    const inputs = await readOrderedTurnInputMessages(this.database, turnId);
+    const currentSegmentIds = new Set(current.records.map(record => requireId(record.segment.id, 'ContextSegment.id')));
+    const references: FrozenCurrentTurnInputReference[] = [];
+    for (const { link } of inputs) {
+      const messageId = requireId(link.message_id, 'MessageTurnLink.message_id');
+      const currentLinks = await this.list('MessageCurrentRevisionLink', { message_id: messageId }, 2);
+      if (currentLinks.length !== 1) throw new Error(`Input Message ${messageId} must have one current revision.`);
+      const messageRevisionId = requireId(currentLinks[0].revision_id, 'MessageCurrentRevisionLink.revision_id');
+      const revision = await this.requireExisting('MessageRevision', messageRevisionId);
+      if (revision.message_id !== messageId || revision.role !== 'user') {
+        throw new Error(`Current input revision ${messageRevisionId} conflicts with Turn ${turnId}.`);
+      }
+      const sources = await listAllDomainRows(this.database, 'ContextSegmentSource', {
+        source_kind: 'message_revision', source_id: messageRevisionId
+      });
+      const presentInCurrentWindow = sources.some(source =>
+        currentSegmentIds.has(requireId(source.segment_id, 'ContextSegmentSource.segment_id')));
+      const contentObjectId = requireId(revision.content_object_id, 'MessageRevision.content_object_id');
+      const contentObject = await this.requireExisting('ContentObject', contentObjectId) as unknown as ContentObjectMetadata;
+      const content = await this.contentStore.read(contentObject);
+      references.push({
+        kind: 'current_turn_input', messageId, messageRevisionId, contentObjectId,
         estimatedTokens: estimateStoredMessageContentTokens(content, contentObject.content_type),
         reinject: !presentInCurrentWindow
-      }
-    };
+      });
+    }
+    return { structure: current, ...(compressionBoundaryId ? { compressionBoundaryId } : {}), references };
   }
 
   private async readRuntimeStatusCard(turnId: string): Promise<{
@@ -4394,9 +4380,8 @@ export function decideOpenTaskCompletion(
 }
 
 function currentInputReferenceTokens(recipe: PlainJsonValue): number {
-  const record = asRecord(recipe);
-  const currentInput = asRecord(record?.currentTurnInput);
-  return optionalNonNegativeInteger(currentInput?.estimatedTokens) ?? 0;
+  return recipeCurrentTurnInputs(recipe).reduce((total, input) =>
+    total + (optionalNonNegativeInteger(input.estimatedTokens) ?? 0), 0);
 }
 
 function compareInteger(left: unknown, right: unknown): number {

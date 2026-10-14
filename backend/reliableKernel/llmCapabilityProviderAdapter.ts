@@ -818,28 +818,28 @@ function* estimateOrdinaryRequestInputWork(request: FullProviderRequest): ModelP
   // turnReminderTokens。重新注入输入的历史副本是普通 user 消息，计入上下文；窗口里已有历史副本时尾巴副本不发送，
   // 也就没有本轮输入。
   const deliveries = turnReminderDeliveries(projected.contents, estimatedTurnReminderLayout(request.providerId, request.modelId));
-  let tailInputSuperseded = false;
+  let supersededTailInputCount = 0;
   const visibleContents = projected.contents.flatMap((content, index) => {
     const marker = readTurnReminderMarker(content);
     if (!marker) return [content];
     if (marker.placement === 'current') {
       if (deliveries[index] !== 'omitted') return [content];
-      if (marker.kind === 'reinjected_input') tailInputSuperseded = true;
+      if (marker.kind === 'reinjected_input') supersededTailInputCount += 1;
       return [];
     }
     const visible = visibleHistoryTurnReminder(content, deliveries[index]);
     return visible ? [visible] : [];
   });
-  const frozenCurrent = request.requestAddenda?.currentTurnInput;
-  const currentInputCount = frozenCurrent?.reinject && !tailInputSuperseded ? 1 : 0;
+  const frozenInputs = request.requestAddenda?.currentTurnInputs ?? [];
+  const currentInputCount = frozenInputs.filter(input => input.reinject).length - supersededTailInputCount;
   const reminderCount = request.requestAddenda?.turnReminder ? 1 : 0;
   const contextEnd = visibleContents.length - currentInputCount - reminderCount;
   const currentEnd = contextEnd + currentInputCount;
   const projectedContext = visibleContents.slice(0, contextEnd);
-  let currentInputContents = currentInputCount
+  const currentInputContents = currentInputCount
     ? visibleContents.slice(contextEnd, currentEnd)
     : [];
-  if (frozenCurrent && !frozenCurrent.reinject) {
+  for (const frozenCurrent of frozenInputs.filter(input => !input.reinject)) {
     const decodedCurrent = decodeFrozenCurrentTurnInput(frozenCurrent.content, frozenCurrent.contentType);
     if (!decodedCurrent || decodedCurrent.role !== 'user') {
       throw new TypeError('Frozen current Turn input must be a user MessageContent.');
@@ -853,7 +853,7 @@ function* estimateOrdinaryRequestInputWork(request: FullProviderRequest): ModelP
       break;
     }
     if (index < 0) throw new Error('Frozen current Turn input is absent from its projected Context window.');
-    currentInputContents = [projectedContext[index]];
+    currentInputContents.push(projectedContext[index]);
     projectedContext.splice(index, 1);
   }
   return yield* estimateProjectedModelInputWork({
@@ -904,7 +904,8 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
   if (retiredHandleNotice) systemParts.push(retiredHandleNotice);
   let contents: MessageContent[] = [];
   const canonicalCompressionRanges: Array<{ start: number; end: number }> = [];
-  const currentTurnInput = request.requestAddenda?.currentTurnInput;
+  const currentTurnInputs = request.requestAddenda?.currentTurnInputs ?? [];
+  const reinjectedInputs = currentTurnInputs.filter(input => input.reinject);
   const attachmentCatalogState = normalizeAttachmentCatalogState(
     request.attachmentCatalogState,
     'Provider request attachmentCatalogState'
@@ -913,7 +914,7 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
     attachmentCatalogState,
     request.context.map((item) => item.segmentId),
     (entry) => requireAttachmentHandle(modelHandleCatalog, entry.attachmentId),
-    { allowCurrentTurnDelta: currentTurnInput?.reinject === true }
+    { allowCurrentTurnDelta: reinjectedInputs.length > 0 }
   );
   const attachmentPlacements = createAttachmentPlacementQueue((content) => contents.push(content));
   let lastResponseIdentity: string | undefined;
@@ -998,24 +999,22 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
   if (nativeReasoning) {
     contents = appendNativeConfigurationUpdates(contents, nativeReasoning);
   }
-  let tailInputIndex: number | undefined;
-  if (currentTurnInput?.reinject) {
-    const current = decodeFrozenCurrentTurnInput(currentTurnInput.content, currentTurnInput.contentType);
+  const supersededTailInputs = new Map<number, TurnReminderDeliveryMode>();
+  for (const [index, input] of reinjectedInputs.entries()) {
+    const current = decodeFrozenCurrentTurnInput(input.content, input.contentType);
     if (!current || current.role !== 'user') {
       throw new TypeError('Frozen current Turn input must be a user MessageContent.');
     }
     const reinjected = reinjectedCurrentTurnInput(current);
-    if (renderedAttachmentState.currentTurn) {
+    // One frozen Turn attachment delta follows the full ordered input set, including on replay.
+    if (index === reinjectedInputs.length - 1 && renderedAttachmentState.currentTurn) {
       reinjected.parts.push(...renderedAttachmentState.currentTurn.parts);
     }
-    tailInputIndex = contents.length;
+    const historical = historyInsertions.find(insertion =>
+      insertion.inputs.some(candidate => candidate.messageRevisionId === input.messageRevisionId));
+    if (historical) supersededTailInputs.set(contents.length, historical.delivery);
     contents.push(reinjected);
   }
-  // 窗口里已有这条输入的历史副本，当前尾部按该副本的冻结方式省略。
-  const historicalInput = tailInputIndex === undefined ? undefined : historyInsertions.find((insertion) =>
-    insertion.input?.messageRevisionId === currentTurnInput?.messageRevisionId);
-  const supersededTailInput = historicalInput && tailInputIndex !== undefined
-    ? { index: tailInputIndex, delivery: historicalInput.delivery } : undefined;
   const turnReminder = request.requestAddenda?.turnReminder;
   if (turnReminder) {
     contents.push({ role: 'user', parts: [{ text: turnReminder.content }] });
@@ -1023,7 +1022,7 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
   const volatileTailContentKinds: NonNullable<
     LlmStartRequest['openAIResponsesContinuation']
   >['volatileTailContentKinds'] = reminderDelivery === 'user_history' ? [] : [
-    ...(currentTurnInput?.reinject ? ['current_turn_input' as const] : []),
+    ...reinjectedInputs.map(() => 'current_turn_input' as const),
     ...(turnReminder ? ['turn_reminder' as const] : [])
   ];
   const systemText = prependSystemPromptPrefix(systemParts.filter(Boolean).join('\n\n'), systemPromptPrefix);
@@ -1038,7 +1037,7 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
     contents.length,
     projection.insertions,
     turnReminder && reminderDelivery ? { ...turnReminder, delivery: reminderDelivery } : undefined,
-    supersededTailInput
+    supersededTailInputs
   );
   return {
     id: request.modelRequestId,
@@ -1046,7 +1045,7 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
     contents: projectedContents,
     ...(readBoundary === undefined ? {} : {
       readBreakpointBeforeContentIndex: readBoundary + historyInsertions.reduce((count, insertion) =>
-        count + (insertion.beforeIndex <= readBoundary! ? Number(!!insertion.input) + Number(insertion.reminder !== undefined) : 0), 0)
+        count + (insertion.beforeIndex <= readBoundary! ? insertion.inputs.length + Number(insertion.reminder !== undefined) : 0), 0)
     }),
     tools,
     model: {
@@ -1104,7 +1103,7 @@ interface HistoryInsertion {
   delivery: TurnReminderDeliveryMode;
   reminder?: string;
   reminderIdentitySplit?: TurnReminderIdentitySplit;
-  input?: { messageRevisionId: string; content: MessageContent };
+  inputs: Array<{ messageRevisionId: string; content: MessageContent }>;
 }
 
 function turnReminderHistoryBySegment(request: FullProviderRequest): Map<string, TurnReminderHistoryEntry> {
@@ -1113,24 +1112,21 @@ function turnReminderHistoryBySegment(request: FullProviderRequest): Map<string,
 
 /** 按那次请求的原样重建：与本请求的尾巴副本同一个构造（标签 part、冻结原文 parts、那次的附件目录增量）。 */
 function historyInsertion(entry: TurnReminderHistoryEntry, beforeIndex: number): HistoryInsertion {
-  let input: HistoryInsertion['input'];
-  if (entry.reinjectedInput) {
-    const current = decodeFrozenCurrentTurnInput(entry.reinjectedInput.content, entry.reinjectedInput.contentType);
+  const inputs = (entry.reinjectedInputs ?? []).map(input => {
+    const current = decodeFrozenCurrentTurnInput(input.content, input.contentType);
     if (!current || current.role !== 'user') {
       throw new TypeError('Historical reinjected Turn input must be a user MessageContent.');
     }
     const content = reinjectedCurrentTurnInput(current);
-    if (entry.reinjectedInput.currentTurnAttachmentState) {
-      content.parts.push(...entry.reinjectedInput.currentTurnAttachmentState.parts);
-    }
-    input = { messageRevisionId: entry.reinjectedInput.messageRevisionId, content };
-  }
+    if (input.currentTurnAttachmentState) content.parts.push(...input.currentTurnAttachmentState.parts);
+    return { messageRevisionId: input.messageRevisionId, content };
+  });
   return {
     beforeIndex,
     delivery: entry.delivery,
     ...(entry.content !== undefined ? { reminder: entry.content } : {}),
     ...(entry.content !== undefined && entry.identitySplit ? { reminderIdentitySplit: entry.identitySplit } : {}),
-    ...(input ? { input } : {})
+    inputs
   };
 }
 
@@ -1152,14 +1148,14 @@ function* projectOrdinaryContentsWithDetachedInputsWork(
   contents: readonly MessageContent[], canonicalRanges: readonly { start: number; end: number }[],
   modelHandleCatalog: ReadonlyModelHandleCatalog, insertions: readonly HistoryInsertion[]
 ): ModelProjectionWork<{ contents: MessageContent[]; insertions: HistoryInsertion[] }> {
-  const detached = insertions.filter((insertion) => insertion.input);
+  const detached = insertions.filter(insertion => insertion.inputs.length > 0);
   if (detached.length === 0) {
     return {
       contents: yield* projectOrdinaryContentsPreservingRangesWork(contents, canonicalRanges, modelHandleCatalog),
       insertions: [...insertions]
     };
   }
-  const projectedInputs = new Map<number, MessageContent>();
+  const projectedInputs = new Map<number, MessageContent[]>();
   const projected = yield* projectOrdinaryContentsPreservingRangesWork(
     contents,
     canonicalRanges,
@@ -1169,17 +1165,19 @@ function* projectOrdinaryContentsWithDetachedInputsWork(
       atCut(index, mediaState) {
         const insertion = detached.find((candidate) => candidate.beforeIndex === index)!;
         projectedInputs.set(index, projectOrdinaryModelContents(
-          [insertion.input!.content],
+          insertion.inputs.map(input => input.content),
           modelHandleCatalog,
           cloneManagedMediaBodyProjectionState(mediaState)
-        )[0]);
+        ));
       }
     }
   );
   return {
     contents: projected,
-    insertions: insertions.map((insertion) => insertion.input
-      ? { ...insertion, input: { ...insertion.input, content: projectedInputs.get(insertion.beforeIndex)! } }
+    insertions: insertions.map(insertion => insertion.inputs.length
+      ? { ...insertion, inputs: insertion.inputs.map((input, index) => ({
+          ...input, content: projectedInputs.get(insertion.beforeIndex)![index]
+        })) }
       : insertion)
   };
 }
@@ -1204,9 +1202,9 @@ function withTurnReminderMarkers(
   contentCount: number,
   insertions: readonly HistoryInsertion[],
   currentReminder: { content: string; identitySplit?: TurnReminderIdentitySplit; delivery: TurnReminderDeliveryMode } | undefined,
-  supersededTailInput?: { index: number; delivery: TurnReminderDeliveryMode }
+  supersededTailInputs: ReadonlyMap<number, TurnReminderDeliveryMode> = new Map()
 ): MessageContent[] {
-  if (insertions.length === 0 && currentReminder === undefined && supersededTailInput === undefined) return projected;
+  if (insertions.length === 0 && currentReminder === undefined && supersededTailInputs.size === 0) return projected;
   if (projected.length !== contentCount) {
     throw new Error('Ordinary Context projection must keep one projected content per input content.');
   }
@@ -1215,7 +1213,7 @@ function withTurnReminderMarkers(
   projected.forEach((content, index) => {
     while (cursor < insertions.length && insertions[cursor].beforeIndex === index) {
       const insertion = insertions[cursor++];
-      if (insertion.input) result.push(markedReinjectedInput(insertion.input.content, 'history', insertion.delivery));
+      for (const input of insertion.inputs) result.push(markedReinjectedInput(input.content, 'history', insertion.delivery));
       if (insertion.reminder !== undefined) {
         result.push(turnReminderContent(insertion.reminder, {
           placement: 'history',
@@ -1224,8 +1222,8 @@ function withTurnReminderMarkers(
         }));
       }
     }
-    result.push(index === supersededTailInput?.index
-      ? markedReinjectedInput(content, 'current', supersededTailInput.delivery) : content);
+    const delivery = supersededTailInputs.get(index);
+    result.push(delivery ? markedReinjectedInput(content, 'current', delivery) : content);
   });
   if (cursor !== insertions.length) throw new Error('Historical turn reminder lost its model output position.');
   if (currentReminder !== undefined) {

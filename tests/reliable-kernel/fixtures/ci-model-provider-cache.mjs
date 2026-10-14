@@ -97,9 +97,31 @@ export function registerProviderCacheTest(test) {
       contentType: 'application/vnd.limcode.compression-contents+json',
       content: JSON.stringify({ kind: 'compression_contents', version: 1, contents: [user('compressed-history')] }) }];
     first.attachmentCatalogState = { catalog: [attachment], placements: [{ kind: 'current_turn_delta', entries: [attachment] }] };
-    first.requestAddenda = { currentTurnInput: current, turnReminder: firstReminder };
+    const followup = { ...current, messageId: 'followup-message', messageRevisionId: 'followup-revision',
+      contentObjectId: 'followup-object', content: JSON.stringify(user('followup-task-input')) };
+    const inputs = [current, followup];
+    // The same ordered references are used by both ordinary and native-frozen replay.
+    first.requestAddenda = { currentTurnInputs: inputs, turnReminder: firstReminder };
+    const beforeCompression = fullRequest(config, inputs.map(input => JSON.parse(input.content)));
+    beforeCompression.requestAddenda = { currentTurnInputs: inputs.map(input => ({ ...input, reinject: false })) };
+    const ordinaryWire = await projectedWire(config, beforeCompression);
+    assert.equal(occurrences(wireText(ordinaryWire.body), 'original-task-input'), 1);
+    assert.equal(occurrences(wireText(ordinaryWire.body), 'followup-task-input'), 1);
+    const single = structuredClone(beforeCompression);
+    single.requestAddenda.currentTurnInputs.pop();
+    const singleWire = await projectedWire(config, single);
+    assert.equal(singleWire.budget.fullTokens, ordinaryWire.budget.fullTokens);
+    assert.ok(ordinaryWire.budget.currentInputTokens > singleWire.budget.currentInputTokens);
     const firstWire = await projectedWire(config, first);
-    const deliveredInput = firstWire.projected.contents.find(content => content.parts.some(part => part.text === 'original-task-input'));
+    const native = structuredClone(first);
+    native.recipe.nativeResponses = { asyncTools: true, steering: true, reasoningUpdates: true };
+    const nativeWire = await projectedWire(config, native);
+    assert.deepEqual(nativeWire.projected.contents, firstWire.projected.contents);
+    assert.deepEqual(nativeWire.budget, firstWire.budget);
+    assert.equal(nativeWire.projected.nativeSessionCapabilities.asyncTools, true);
+    const deliveredInput = firstWire.projected.contents.find(content => content.parts.some(part => part.text === 'followup-task-input'));
+    assert.equal(occurrences(wireText(firstWire.body), 'original-task-input'), 1);
+    assert.equal(occurrences(wireText(firstWire.body), 'followup-task-input'), 1);
     assert.ok(deliveredInput.parts.some(part => part.text?.includes('preserved-attachment.txt')));
 
     const second = structuredClone(first);
@@ -107,15 +129,18 @@ export function registerProviderCacheTest(test) {
     answer.segmentId = 'answer';
     answer.sourceModelRequestId = 'logical-c';
     second.context.push(answer);
-    second.requestAddenda = { currentTurnInput: current, turnReminder: snapshot('new-runtime-snapshot'), turnReminderHistory: [
-      { segmentId: 'answer', delivery: 'user_history', content: firstReminder.content, reinjectedInput: {
-        messageRevisionId: current.messageRevisionId, contentType: current.contentType, content: current.content,
-        currentTurnAttachmentState: { role: 'user', parts: deliveredInput.parts.slice(2) }
-      } }
+    second.requestAddenda = { currentTurnInputs: inputs, turnReminder: snapshot('new-runtime-snapshot'), turnReminderHistory: [
+      { segmentId: 'answer', delivery: 'user_history', content: firstReminder.content,
+        reinjectedInputs: inputs.map((input, index) => ({
+          messageRevisionId: input.messageRevisionId, contentType: input.contentType, content: input.content,
+          ...(index === inputs.length - 1
+            ? { currentTurnAttachmentState: { role: 'user', parts: deliveredInput.parts.slice(2) } } : {})
+        })) }
     ] };
     const secondWire = await projectedWire(config, second);
     assert.deepEqual(secondWire.body.input.slice(0, firstWire.body.input.length), firstWire.body.input);
     assert.equal(occurrences(wireText(secondWire.body), 'original-task-input'), 1);
+    assert.equal(occurrences(wireText(secondWire.body), 'followup-task-input'), 1);
     assert.equal(occurrences(wireText(secondWire.body), 'preserved-attachment.txt'), 1);
     assert.equal(secondWire.budget.currentInputTokens, 0);
     assert.ok(firstWire.budget.currentInputTokens > 0);
@@ -129,6 +154,7 @@ export function registerProviderCacheTest(test) {
     const switchedWire = await projectedWire(claude, switched);
     assert.equal(switchedWire.body.messages.some(message => message.role === 'system'), false);
     assert.equal(occurrences(wireText(switchedWire.body), 'original-task-input'), 1);
+    assert.equal(occurrences(wireText(switchedWire.body), 'followup-task-input'), 1);
     assert.equal(occurrences(wireText(switchedWire.body), 'preserved-attachment.txt'), 1);
     const plain = fullRequest(claude, reminderLayout.layoutTurnReminderContents(switchedWire.projected.contents, 'claude_turn_scoped'));
     const plainBudget = new kernel.LlmCapabilityFullRequestAdapter(claude.id, fakeCapability(() => {})).estimateFullRequestInput(plain);

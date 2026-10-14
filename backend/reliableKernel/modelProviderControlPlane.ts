@@ -1,3 +1,4 @@
+import { readOrderedTurnInputMessages } from './turnInputMessages';
 import { resolveFrozenToolDefinitions } from './frozenToolDefinitions';
 import type { ReliableAgentToolDefinition } from './agentLoop';
 import { frozenRecipeAttachmentHandles, resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
@@ -39,7 +40,8 @@ import {
   claudeTurnScopedCompaction,
   claudeTurnScopedRemindersEnabled,
   projectTurnReminder,
-  recipeReinjectedCurrentTurnInput,
+  recipeCurrentTurnInputs,
+  recipeReinjectedCurrentTurnInputs,
   recipeTurnReminderDelivery,
   reminderHistoryForRequest,
   USER_HISTORY_REMINDER_DELIVERY,
@@ -183,14 +185,14 @@ export interface FullProviderRequest {
    */
   claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
   requestAddenda?: {
-    currentTurnInput?: {
+    currentTurnInputs?: Array<{
       messageId: string;
       messageRevisionId: string;
       contentObjectId: string;
       reinject: boolean;
       contentType: string;
       content: string;
-    };
+    }>;
     turnReminder?: {
       content: string;
       /** 有运行状态卡时才有：轮内系统消息模式下运行状态卡保持 user 身份，只有其余部分作为系统消息。 */
@@ -204,7 +206,7 @@ export interface FullProviderRequest {
      * 之前每次请求发过、之后仍要原样放回的内容，按那次请求冻结的
      * recipe 逐字节重新生成，挂在那次请求模型输出所在的 Context 片段上，发送时放回它的前面。
      * - content：那次请求的提醒；
-     * - reinjectedInput：那次请求作为易失尾巴重新注入的当前 Turn 输入。同一窗口里同一条输入只在第一次出现时带上：
+     * - reinjectedInputs：那次请求作为易失尾巴重新注入的当前 Turn 输入。同一窗口里同一条输入只在第一次出现时带上：
      *   之后的请求看到它已在窗口里，尾巴不再重发，因此也就没有要放回的副本。
      * 没有模型输出进入 Context 的请求（失败、取消）不会出现在这里；未冻结历史发送方式的请求也不会。
      * Responses user 快照在普通请求与原生压缩中保持 user；Claude 轮内系统消息按其既有开关与同模型压缩规则重放。
@@ -219,13 +221,13 @@ export interface TurnReminderHistoryEntry {
   content?: string;
   /** 那次请求提醒的身份拆分（有运行状态卡时）；与那次请求发出时相同。 */
   identitySplit?: TurnReminderIdentitySplit;
-  reinjectedInput?: {
+  reinjectedInputs?: Array<{
     messageRevisionId: string;
     contentType: string;
     content: string;
     /** 那次请求随重新注入的输入一起渲染的本 Turn 附件目录增量（current_turn_delta）。 */
     currentTurnAttachmentState?: MessageContent;
-  };
+  }>;
 }
 
 /** 一次历史请求要原样放回的内容，只取决于它不可变的 recipe。 */
@@ -235,7 +237,7 @@ interface HistoricalRequestFacts {
   readonly reminderIdentitySplit?: Readonly<TurnReminderIdentitySplit>;
   // The renderer produces one user text part. Keep only that immutable scalar in the cache,
   // then reconstruct the tiny MessageContent envelope for each request.
-  readonly reinjectedInput?: Readonly<ReinjectedCurrentTurnInputReference & { currentTurnAttachmentText?: string }>;
+  readonly reinjectedInputs: readonly Readonly<ReinjectedCurrentTurnInputReference & { currentTurnAttachmentText?: string }>[];
 }
 
 export type ProviderOutputStreamEventKind = 'output_delta' | 'output_item_done' | 'completed' | 'native_control';
@@ -1033,12 +1035,7 @@ export class ModelProviderControlPlane {
       : undefined;
     assertAttachmentProjectionCoverage(attachmentCatalogState.catalog, [
       ...providerContext,
-      ...(requestAddenda.requestAddenda?.currentTurnInput
-        ? [{
-            content: requestAddenda.requestAddenda.currentTurnInput.content,
-            contentType: requestAddenda.requestAddenda.currentTurnInput.contentType
-          }]
-        : [])
+      ...(requestAddenda.requestAddenda?.currentTurnInputs ?? [])
     ]);
     return {
       kind: 'full-model-request',
@@ -1120,12 +1117,7 @@ export class ModelProviderControlPlane {
     }));
     assertAttachmentProjectionCoverage(attachmentCatalogState.catalog, [
       ...providerContext,
-      ...(requestAddenda.requestAddenda?.currentTurnInput
-        ? [{
-            content: requestAddenda.requestAddenda.currentTurnInput.content,
-            contentType: requestAddenda.requestAddenda.currentTurnInput.contentType
-          }]
-        : [])
+      ...(requestAddenda.requestAddenda?.currentTurnInputs ?? [])
     ]);
     return {
       kind: 'full-model-request',
@@ -2822,79 +2814,61 @@ export class ModelProviderControlPlane {
     expectedTurnId: string
   ): Promise<Pick<FullProviderRequest, 'requestAddenda'>> {
     if (!isRecord(recipe) || recipe.kind !== 'reliable-agent-turn') return {};
-    const currentRef = isRecord(recipe.currentTurnInput) ? recipe.currentTurnInput : undefined;
-    const hasCurrentReference = currentRef !== undefined;
-    const reinjectCurrent = currentRef?.reinject === true;
-    let currentTurnInput: NonNullable<FullProviderRequest['requestAddenda']>['currentTurnInput'];
-    if (hasCurrentReference) {
-      const messageId = requireId(currentRef.messageId, 'ModelRequest recipe.currentTurnInput.messageId');
-      const messageRevisionId = requireId(
-        currentRef.messageRevisionId,
-        'ModelRequest recipe.currentTurnInput.messageRevisionId'
-      );
-      const contentObjectId = requireId(
-        currentRef.contentObjectId,
-        'ModelRequest recipe.currentTurnInput.contentObjectId'
-      );
+    const references = recipeCurrentTurnInputs(recipe);
+    const ordered = recipe.currentTurnInputs !== undefined || references.length
+      ? await readOrderedTurnInputMessages(this.database, expectedTurnId) : [];
+    if (ordered.length !== references.length) {
+      throw new Error('Frozen current Turn inputs do not cover the complete ordered input set.');
+    }
+    const currentTurnInputs: NonNullable<FullProviderRequest['requestAddenda']>['currentTurnInputs'] = [];
+    for (const [index, currentRef] of references.entries()) {
+      const messageId = requireId(currentRef.messageId, 'ModelRequest current Turn input.messageId');
+      const messageRevisionId = requireId(currentRef.messageRevisionId, 'ModelRequest current Turn input.messageRevisionId');
+      const contentObjectId = requireId(currentRef.contentObjectId, 'ModelRequest current Turn input.contentObjectId');
       const snapshot = await this.database.snapshot([
         DOMAIN_REPOSITORIES.domain('MessageRevision').get(messageRevisionId),
-        DOMAIN_REPOSITORIES.domain('MessageTurnLink').list({
-          where: { turn_id: expectedTurnId, message_id: messageId, role: 'input' }, limit: 2
-        }),
         DOMAIN_REPOSITORIES.domain('ContentObject').get(contentObjectId)
       ]);
       const revision = snapshot.snapshot[0];
-      const links = rows(snapshot.snapshot[1]);
-      const metadata = requireRow(snapshot.snapshot[2], `ContentObject ${contentObjectId}`);
+      const metadata = requireRow(snapshot.snapshot[1], `ContentObject ${contentObjectId}`);
       if (Array.isArray(revision) || (revision && (revision.message_id !== messageId
-        || revision.content_object_id !== contentObjectId || revision.role !== 'user')) || links.length > 1) {
+        || revision.content_object_id !== contentObjectId || revision.role !== 'user'))) {
         throw new Error('Frozen current Turn input reference conflicts with durable Message facts.');
       }
-      if (!revision || links.length !== 1) {
-        await this.assertCopiedCurrentTurnInput(expectedTurnId, messageRevisionId, contentObjectId);
+      const targetMessageId = requireId(ordered[index].link.message_id, 'Input MessageTurnLink.message_id');
+      if (!revision || targetMessageId !== messageId) {
+        await this.assertCopiedCurrentTurnInput(targetMessageId, messageRevisionId, contentObjectId);
       }
-      currentTurnInput = {
-        messageId,
-        messageRevisionId,
-        contentObjectId,
-        reinject: reinjectCurrent,
+      currentTurnInputs.push({
+        messageId, messageRevisionId, contentObjectId, reinject: currentRef.reinject === true,
         contentType: requireText(metadata.content_type, 'Current Turn input ContentObject.content_type'),
-        content: decodeUtf8Exact(
-          await this.contentStore.read(asContentObjectMetadata(metadata)),
-          `Current Turn input ${messageRevisionId}`
-        )
-      };
+        content: decodeUtf8Exact(await this.contentStore.read(asContentObjectMetadata(metadata)),
+          `Current Turn input ${messageRevisionId}`)
+      });
     }
     const turnReminder = projectTurnReminder(recipe);
-    if (!currentTurnInput && !turnReminder) return {};
+    if (!currentTurnInputs.length && !turnReminder) return {};
     return { requestAddenda: {
-      ...(currentTurnInput ? { currentTurnInput } : {}),
+      ...(currentTurnInputs.length ? { currentTurnInputs } : {}),
       ...(turnReminder ? { turnReminder } : {})
     } };
   }
 
-  /** Copied recipes keep original input ids. Shared immutable segment provenance proves the
-   * target Turn's exact copied revision even after its source Message and Conversation are gone.
-   * Read neither a current revision nor a same-content substitute: revision ordinal, segment and
-   * CAS identity must all agree. Results are bounded; the input lookup uses the Turn index prefix.
-   */
-  private async assertCopiedCurrentTurnInput(turnId: string, originalRevisionId: string, contentObjectId: string): Promise<void> {
-    const evidence = await this.database.snapshot([
-      DOMAIN_REPOSITORIES.domain('MessageTurnLink').list({ where: { turn_id: turnId, role: 'input' }, limit: 2 }),
+  /** Copied recipes keep original ids. Check the exact ordered target input against the original
+   * immutable segment and revision ordinal, not another same-content input in the copied Turn. */
+  private async assertCopiedCurrentTurnInput(targetMessageId: string, originalRevisionId: string, contentObjectId: string): Promise<void> {
+    const originals = rows((await this.database.snapshot([
       DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
         where: { source_kind: 'message_revision', source_id: originalRevisionId }, limit: 2
       })
-    ]);
-    const links = rows(evidence.snapshot[0]);
-    const originals = rows(evidence.snapshot[1]);
-    if (links.length !== 1 || originals.length !== 1) {
+    ])).snapshot[0]);
+    if (originals.length !== 1) {
       throw new Error('Frozen current Turn input has no unique copied Message provenance.');
     }
     const original = originals[0];
     const source = await this.database.snapshot([
       DOMAIN_REPOSITORIES.domain('MessageRevision').list({ where: {
-        message_id: requireId(links[0].message_id, 'Copied input MessageTurnLink.message_id'),
-        revision_seq: original.source_revision
+        message_id: targetMessageId, revision_seq: original.source_revision
       }, limit: 2 }),
       DOMAIN_REPOSITORIES.domain('ContextSegment').get(requireId(original.segment_id, 'Frozen input ContextSegmentSource.segment_id'))
     ]);
@@ -2965,7 +2939,7 @@ export class ModelProviderControlPlane {
       delivery: TurnReminderDeliveryMode;
       reminder?: string;
       reminderIdentitySplit?: TurnReminderIdentitySplit;
-      input?: HistoricalRequestFacts['reinjectedInput'];
+      inputs: HistoricalRequestFacts['reinjectedInputs'];
     }> = [];
     for (const segment of sources) {
       const recipeId = segment.sourceRecipeObjectId as string;
@@ -2973,21 +2947,19 @@ export class ModelProviderControlPlane {
       placedRecipes.add(recipeId);
       const historical = facts.get(recipeId);
       if (!historical || (historical.delivery !== USER_HISTORY_REMINDER_DELIVERY && !replayClaude)) continue;
-      const input = historical.reinjectedInput && !placedInputs.has(historical.reinjectedInput.messageRevisionId)
-        ? historical.reinjectedInput
-        : undefined;
-      if (input) placedInputs.add(input.messageRevisionId);
-      if (historical.reminder === undefined && !input) continue;
+      const inputs = historical.reinjectedInputs.filter(input => !placedInputs.has(input.messageRevisionId));
+      for (const input of inputs) placedInputs.add(input.messageRevisionId);
+      if (historical.reminder === undefined && inputs.length === 0) continue;
       planned.push({
         segmentId: segment.segmentId,
         delivery: historical.delivery,
         ...(historical.reminder !== undefined ? { reminder: historical.reminder } : {}),
         ...(historical.reminderIdentitySplit ? { reminderIdentitySplit: historical.reminderIdentitySplit } : {}),
-        ...(input ? { input } : {})
+        inputs
       });
     }
     if (planned.length === 0) return undefined;
-    const inputObjectIds = [...new Set(planned.flatMap((entry) => entry.input ? [entry.input.contentObjectId] : []))];
+    const inputObjectIds = [...new Set(planned.flatMap(entry => entry.inputs.map(input => input.contentObjectId)))];
     const inputs = new Map<string, { contentType: string; content: string }>();
     if (inputObjectIds.length > 0) {
       const snapshot = await this.database.snapshot(inputObjectIds.map((id) => DOMAIN_REPOSITORIES.domain('ContentObject').get(id)));
@@ -3000,26 +2972,18 @@ export class ModelProviderControlPlane {
       }));
     }
     return planned.map((entry) => {
-      const input = entry.input ? inputs.get(entry.input.contentObjectId) : undefined;
       return {
         segmentId: entry.segmentId,
         delivery: entry.delivery,
         ...(entry.reminder !== undefined ? { content: entry.reminder } : {}),
         ...(entry.reminderIdentitySplit ? { identitySplit: { ...entry.reminderIdentitySplit } } : {}),
-        ...(entry.input && input
-          ? {
-              reinjectedInput: {
-                messageRevisionId: entry.input.messageRevisionId,
-                contentType: input.contentType,
-                content: input.content,
-                ...(entry.input.currentTurnAttachmentText !== undefined
-                  ? { currentTurnAttachmentState: {
-                      role: 'user' as const, parts: [{ text: entry.input.currentTurnAttachmentText }]
-                    } }
-                  : {})
-              }
-            }
-          : {})
+        ...(entry.inputs.length ? { reinjectedInputs: entry.inputs.map(reference => {
+          const input = inputs.get(reference.contentObjectId)!;
+          return { messageRevisionId: reference.messageRevisionId, ...input,
+            ...(reference.currentTurnAttachmentText !== undefined ? { currentTurnAttachmentState: {
+              role: 'user' as const, parts: [{ text: reference.currentTurnAttachmentText }]
+            } } : {}) };
+        }) } : {})
       };
     });
   }
@@ -3620,16 +3584,14 @@ class HistoricalTurnReminderCache {
   }
 
   public set(recipeObjectId: string, facts: HistoricalRequestFacts | null): void {
-    const input = facts?.reinjectedInput;
     // Fixed scalar work at insertion. Do not recursively measure a retained recipe or stringify
     // attachment/catalog graphs merely to decide whether the small projection fits.
     const bytes = 128 + recipeObjectId.length * 2 + (facts === null ? 0 : 256 + 2 * (
       (facts.reminder?.length ?? 0)
       + (facts.reminderIdentitySplit?.user.length ?? 0)
       + (facts.reminderIdentitySplit?.system?.length ?? 0)
-      + (input?.messageRevisionId.length ?? 0)
-      + (input?.contentObjectId.length ?? 0)
-      + (input?.currentTurnAttachmentText?.length ?? 0)
+      + facts.reinjectedInputs.reduce((sum, input) => sum + 64 + input.messageRevisionId.length
+        + input.contentObjectId.length + (input.currentTurnAttachmentText?.length ?? 0), 0)
     ));
     // An oversized fact must not empty the cache of useful small/negative facts.
     if (!Number.isSafeInteger(bytes) || bytes > HISTORICAL_REMINDER_CACHE_MAX_BYTES) return;
@@ -3675,10 +3637,10 @@ function historicalRequestFacts(recipe: PlainJsonValue, recipeObjectId: string):
   if (!delivery) return null;
   const projected = projectTurnReminder(recipe);
   const reminder = projected?.content;
-  const input = recipeReinjectedCurrentTurnInput(recipe);
-  if (reminder === undefined && !input) return null;
+  const inputs = recipeReinjectedCurrentTurnInputs(recipe);
+  if (reminder === undefined && inputs.length === 0) return null;
   let currentTurnAttachmentText: string | undefined;
-  if (input && isRecord(recipe)) {
+  if (inputs.length && isRecord(recipe)) {
     const state = normalizeAttachmentCatalogState(
       recipe.attachmentCatalogState,
       `ModelRequest recipe ${recipeObjectId}.attachmentCatalogState`
@@ -3702,8 +3664,8 @@ function historicalRequestFacts(recipe: PlainJsonValue, recipeObjectId: string):
     delivery,
     ...(reminder !== undefined ? { reminder } : {}),
     ...(projected?.identitySplit ? { reminderIdentitySplit: Object.freeze({ ...projected.identitySplit }) } : {}),
-    ...(input ? { reinjectedInput: Object.freeze({ ...input,
-      ...(currentTurnAttachmentText !== undefined ? { currentTurnAttachmentText } : {}) }) } : {})
+    reinjectedInputs: Object.freeze(inputs.map((input, index) => Object.freeze({ ...input,
+      ...(index === inputs.length - 1 && currentTurnAttachmentText !== undefined ? { currentTurnAttachmentText } : {}) })))
   });
 }
 
